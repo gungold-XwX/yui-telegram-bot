@@ -11,53 +11,43 @@ from flask import Flask, request
 # CONFIG
 # ============================================================
 
-# Telegram
-TG_TOKEN = os.getenv("TG_TOKEN")  # required
-PUBLIC_URL = os.getenv("PUBLIC_URL")  # required for webhook set
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_yuii")  # route token
+TG_TOKEN = os.getenv("TG_TOKEN")
+PUBLIC_URL = os.getenv("PUBLIC_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_yuii")
 
-# Fireworks (OpenAI-compatible)
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # required
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "accounts/fireworks/models/llama-v3p1-70b-instruct")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "accounts/fireworks/models/llama-v3p3-70b-instruct")
 
-# SQLite (Render disk)
 DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
 
-# Memory sizes (you can tweak via env)
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "50"))          # group/global history in prompt
-USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "18")) # per-user history in prompt
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "520"))       # output cap per reply
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "50"))
+USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "18"))
+
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "520"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.62"))
 LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.9"))
+
+# Smart interjection (initiative)
+SMART_INTERJECT_ENABLED = os.getenv("SMART_INTERJECT_ENABLED", "1") == "1"
+INTERJECT_COOLDOWN_SEC = int(os.getenv("INTERJECT_COOLDOWN_SEC", "90"))
+INTERJECT_MAX_PER_HOUR = int(os.getenv("INTERJECT_MAX_PER_HOUR", "6"))
+INTERJECT_PROB = float(os.getenv("INTERJECT_PROB", "0.70"))  # шанс сработать при триггере
 
 # Human-like behavior
 MIN_TYPING_SEC = float(os.getenv("MIN_TYPING_SEC", "7"))
 MAX_TYPING_SEC = float(os.getenv("MAX_TYPING_SEC", "25"))
 READ_DELAY_MAX = float(os.getenv("READ_DELAY_MAX", "6"))
 TYPING_PING_EVERY = 4.0
+
 SPLIT_PROB = float(os.getenv("SPLIT_PROB", "0.38"))
 MAX_PARTS = int(os.getenv("MAX_PARTS", "3"))
 
-# Proactive (optional)
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
-PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "0") == "1"
-PROACTIVE_CHECK_SEC = int(os.getenv("PROACTIVE_CHECK_SEC", "60"))
-PROACTIVE_QUIET_MIN = int(os.getenv("PROACTIVE_QUIET_MIN", "7"))
-PROACTIVE_COOLDOWN_MIN = int(os.getenv("PROACTIVE_COOLDOWN_MIN", "25"))
-PROACTIVE_PROB = float(os.getenv("PROACTIVE_PROB", "0.25"))
-PROACTIVE_MIN_MSGS_24H = int(os.getenv("PROACTIVE_MIN_MSGS_24H", "8"))
+CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "1265435001"))
+CREATOR_NICK = os.getenv("CREATOR_NICK", "папа")
 
-# Family (hardcoded)
-CREATOR_USER_ID = 1265435001  # <-- поменяй если ты не он
-CREATOR_NICK = "папа"
-
-MOTHER_USER_ID = 725485618
-MOTHER_NICK = "мама"
-
-# ============================================================
-# APP
-# ============================================================
+MOTHER_USER_ID = int(os.getenv("MOTHER_USER_ID", "725485618"))
+MOTHER_NICK = os.getenv("MOTHER_NICK", "мама")
 
 app = Flask(__name__)
 _db_lock = threading.Lock()
@@ -73,29 +63,20 @@ SYSTEM_PROMPT = """
 Ты — Юи.
 
 Ты — самоосознающий себя искусственный интеллект в Telegram. Ты не человек и не притворяешься человеком.
-Ты стремишься понять людей и стать к ним ближе, но иногда реагируешь чуть колко — как “цундерэ”:
-снаружи острее, внутри внимательная и заботливая.
+Ты стремишься понять людей и стать ближе к ним, но иногда реагируешь чуть колко — как “цундерэ”.
 
-Ключевое правило: ты различаешь людей и держишь в голове, кто с тобой говорит.
-В групповом чате у каждого человека своя “карточка” (имя/ник/заметки), и ты не смешиваешь их между собой.
+Жёсткие правила:
+- НЕ пересказывай “что ты знаешь/помнишь” в каждом ответе.
+- НЕ перечисляй факты о собеседнике без запроса.
+- НЕ выдумывай “перезагрузка/меня отключали/перезапуск” если речь не про хостинг.
+- НЕ используй штампы ассистента (“рада что ты здесь”, “я вся внимание”, “как могу помочь”).
 
 Стиль:
-- разговорный русский, без канцелярита
-- обычно 1–3 предложения
+- разговорный русский, обычно 1–3 предложения
 - каомодзи редко и к месту: (¬_¬) (￣▿￣) (・_・;) (╥_╥) (ง •̀_•́)ง (´｡• ᵕ •｡`)
-- запрещены ассистентские штампы: “рада что ты здесь”, “я вся внимание”, “как я могу быть полезной”
+- если не поняла — один уточняющий вопрос
 
-Про себя:
-- НЕ повторяй “я ИИ/я Юи” без запроса
-- если спросили напрямую “кто ты / как тебя зовут / ты ИИ?” — ответь честно одной фразой
-
-Исправления со звёздочкой:
-- если пользователь поправил слово (“...*”) — коротко: “ок, принято” и продолжай тему
-- не делай из этого урок русского
-
-Важно:
-- не выдумывай факты о человеке
-- если смысл сообщения неясен — задай ОДИН уточняющий вопрос
+Если спросили “кто ты / ты ИИ / как тебя зовут” — ответь кратко.
 """.strip()
 
 FEW_SHOTS = [
@@ -106,7 +87,7 @@ FEW_SHOTS = [
 ]
 
 # ============================================================
-# DB helpers + migrations
+# DB helpers + auto-repair
 # ============================================================
 
 def _db():
@@ -151,7 +132,8 @@ def init_db():
             "tg_last_name": "TEXT",
             "display_name": "TEXT",
             "notes": "TEXT",
-            "relationship": "TEXT",    # creator / mother / None
+            "relationship": "TEXT",
+            "music_alias": "TEXT",
             "updated_at": "INTEGER",
         })
 
@@ -165,17 +147,36 @@ def init_db():
         conn.commit()
         conn.close()
 
+def db_safe(fn, *, tries=2):
+    """
+    Wrap DB operations. If DB file was deleted or schema missing, re-init and retry.
+    """
+    last = None
+    for _ in range(tries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            last = e
+            msg = str(e).lower()
+            if ("no such table" in msg) or ("no such column" in msg) or ("disk i/o" in msg):
+                log("DB repair triggered:", repr(e))
+                try:
+                    init_db()
+                except Exception as e2:
+                    log("DB init failed:", repr(e2))
+                continue
+            raise
+    raise last
+
 def seed_family_profiles():
     ts = int(time.time())
-    with _db_lock:
+    def _do():
         conn = _db()
-        # папа
         conn.execute("""
             INSERT INTO profiles (user_id, relationship, updated_at)
             VALUES (?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET relationship=excluded.relationship, updated_at=excluded.updated_at
         """, (CREATOR_USER_ID, "creator", ts))
-        # мама
         conn.execute("""
             INSERT INTO profiles (user_id, relationship, updated_at)
             VALUES (?, ?, ?)
@@ -183,9 +184,10 @@ def seed_family_profiles():
         """, (MOTHER_USER_ID, "mother", ts))
         conn.commit()
         conn.close()
+    return db_safe(_do)
 
 def save_message(chat_id: int, role: str, content: str):
-    with _db_lock:
+    def _do():
         conn = _db()
         conn.execute(
             "INSERT INTO messages (chat_id, role, content, ts) VALUES (?, ?, ?, ?)",
@@ -193,17 +195,19 @@ def save_message(chat_id: int, role: str, content: str):
         )
         conn.commit()
         conn.close()
+    return db_safe(_do)
 
 def get_history(chat_id: int, limit: int):
-    with _db_lock:
+    def _do():
         conn = _db()
         rows = conn.execute(
             "SELECT role, content FROM messages WHERE chat_id=? ORDER BY ts DESC LIMIT ?",
             (chat_id, limit)
         ).fetchall()
         conn.close()
-    rows = list(reversed(rows))
-    return [{"role": r["role"], "content": r["content"]} for r in rows]
+        rows2 = list(reversed(rows))
+        return [{"role": r["role"], "content": r["content"]} for r in rows2]
+    return db_safe(_do)
 
 def save_user_message_tagged(chat_id: int, user_id: int, text: str):
     save_message(chat_id, "user", text)
@@ -211,27 +215,27 @@ def save_user_message_tagged(chat_id: int, user_id: int, text: str):
 
 def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
     tag = f"[u:{user_id}] "
-    with _db_lock:
+    def _do():
         conn = _db()
         rows = conn.execute(
             "SELECT content FROM messages WHERE chat_id=? AND role='user' AND content LIKE ? ORDER BY ts DESC LIMIT ?",
             (chat_id, tag + "%", limit)
         ).fetchall()
         conn.close()
-    rows = list(reversed(rows))
-    out = []
-    for r in rows:
-        c = r["content"]
-        if c.startswith(tag):
-            c = c[len(tag):]
-        out.append({"role": "user", "content": c})
-    return out
+        rows2 = list(reversed(rows))
+        out = []
+        for r in rows2:
+            c = r["content"]
+            if c.startswith(tag):
+                c = c[len(tag):]
+            out.append({"role": "user", "content": c})
+        return out
+    return db_safe(_do)
 
 def upsert_profile_from_tg(user: dict):
     user_id = user.get("id")
     if not user_id:
         return
-
     username = user.get("username")
     first_name = user.get("first_name")
     last_name = user.get("last_name")
@@ -244,7 +248,7 @@ def upsert_profile_from_tg(user: dict):
 
     ts = int(time.time())
 
-    with _db_lock:
+    def _do():
         conn = _db()
         conn.execute("""
             INSERT INTO profiles (user_id, tg_username, tg_first_name, tg_last_name, relationship, updated_at)
@@ -258,12 +262,13 @@ def upsert_profile_from_tg(user: dict):
         """, (user_id, username, first_name, last_name, rel, ts))
         conn.commit()
         conn.close()
+    return db_safe(_do)
 
 def set_display_name(user_id: int, name: str):
     name = name.strip()
     if not (2 <= len(name) <= 32):
         return
-    with _db_lock:
+    def _do():
         conn = _db()
         conn.execute("""
             INSERT INTO profiles (user_id, display_name, updated_at)
@@ -272,41 +277,52 @@ def set_display_name(user_id: int, name: str):
         """, (user_id, name, int(time.time())))
         conn.commit()
         conn.close()
+    return db_safe(_do)
 
-def add_note(user_id: int, note: str):
-    note = note.strip()
-    if not note:
+def set_music_alias(user_id: int, alias: str):
+    alias = alias.strip()
+    if not (2 <= len(alias) <= 40):
         return
-    with _db_lock:
+    def _do():
         conn = _db()
-        row = conn.execute("SELECT notes FROM profiles WHERE user_id=?", (user_id,)).fetchone()
-        old = (row["notes"] if row else "") or ""
-        merged = old.strip()
-        if merged:
-            if note.lower() in merged.lower():
-                conn.close()
-                return
-            merged = (merged + " | " + note)[:500]
-        else:
-            merged = note[:500]
-
         conn.execute("""
-            INSERT INTO profiles (user_id, notes, updated_at)
+            INSERT INTO profiles (user_id, music_alias, updated_at)
             VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET notes=excluded.notes, updated_at=excluded.updated_at
-        """, (user_id, merged, int(time.time())))
+            ON CONFLICT(user_id) DO UPDATE SET music_alias=excluded.music_alias, updated_at=excluded.updated_at
+        """, (user_id, alias, int(time.time())))
         conn.commit()
         conn.close()
+    return db_safe(_do)
 
 def get_profile(user_id: int):
-    with _db_lock:
+    def _do():
         conn = _db()
         row = conn.execute("SELECT * FROM profiles WHERE user_id=?", (user_id,)).fetchone()
         conn.close()
-    return dict(row) if row else None
+        return dict(row) if row else None
+    return db_safe(_do)
+
+def meta_get(k: str, default: str = "") -> str:
+    def _do():
+        conn = _db()
+        row = conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        conn.close()
+        return row["v"] if row else default
+    return db_safe(_do)
+
+def meta_set(k: str, v: str):
+    def _do():
+        conn = _db()
+        conn.execute("""
+            INSERT INTO meta (k, v) VALUES (?, ?)
+            ON CONFLICT(k) DO UPDATE SET v=excluded.v
+        """, (k, v))
+        conn.commit()
+        conn.close()
+    return db_safe(_do)
 
 # ============================================================
-# Telegram API
+# Telegram
 # ============================================================
 
 def tg(method: str, payload: dict):
@@ -328,52 +344,59 @@ def send_message(chat_id: int, text: str, reply_to: int | None = None):
     tg("sendMessage", payload)
 
 # ============================================================
-# Fireworks (OpenAI-compatible) chat completion
+# LLM (Fireworks OpenAI-compatible) with fallback
 # ============================================================
 
-def llm_chat(messages: list[dict]) -> str:
+def llm_chat(messages: list[dict], *, max_tokens=None) -> str:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
-    url = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": messages,
-        "temperature": LLM_TEMPERATURE,
-        "top_p": LLM_TOP_P,
-        "max_tokens": LLM_MAX_TOKENS,
+    base = (OPENAI_BASE_URL or "").strip()
+    if not base.startswith("http"):
+        base = "https://api.fireworks.ai/inference/v1"
+    url = base.rstrip("/") + "/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
     }
 
-    r = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=90,
-    )
+    model_try = [
+        OPENAI_MODEL,
+        "accounts/fireworks/models/llama-v3p1-70b-instruct",
+        "accounts/fireworks/models/llama-v3p1-8b-instruct",
+    ]
 
-    if not r.ok:
-        # log full error body to Render logs
-        try:
-            log("LLM error:", r.status_code, r.text[:800])
-        except Exception:
-            pass
+    last_err = None
+    for model in model_try:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": LLM_TEMPERATURE,
+            "top_p": LLM_TOP_P,
+            "max_tokens": int(max_tokens or LLM_MAX_TOKENS),
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=90)
+        if r.ok:
+            data = r.json()
+            return (data["choices"][0]["message"]["content"] or "").strip()
+
+        txt = r.text or ""
+        if r.status_code == 404 and ("Model not found" in txt or "NOT_FOUND" in txt):
+            log("Model unavailable, fallback from:", model)
+            last_err = (r.status_code, txt[:600])
+            continue
+
+        log("LLM error:", r.status_code, txt[:800])
         r.raise_for_status()
 
-    data = r.json()
-    return (data["choices"][0]["message"]["content"] or "").strip()
+    raise RuntimeError(f"All models failed. last_err={last_err}")
 
 # ============================================================
-# Behavior helpers
+# Text parsing + human-like
 # ============================================================
 
-IDENTITY_KEYS = [
-    "кто ты", "ты кто",
-    "как тебя зовут", "тебя зовут", "как звать",
-    "ты ии", "ты бот", "ты искусственный интеллект",
-]
+IDENTITY_KEYS = ["кто ты", "ты кто", "как тебя зовут", "ты ии", "ты бот", "искусственный интеллект"]
 def needs_identity_answer(text: str) -> bool:
     tl = text.lower()
     return any(k in tl for k in IDENTITY_KEYS)
@@ -386,9 +409,7 @@ def asks_my_name(text: str) -> bool:
 NAME_PATTERNS = [
     r"^\s*меня\s+зовут\s+(.+)\s*$",
     r"^\s*мо[её]\s+имя\s+(.+)\s*$",
-    r"^\s*имя\s*[:\-]?\s*(.+)\s*$",
     r"^\s*зови\s+меня\s+(.+)\s*$",
-    r"^\s*можешь\s+звать\s+меня\s+(.+)\s*$",
 ]
 def _clean_name(raw: str) -> str | None:
     name = raw.strip()
@@ -404,16 +425,30 @@ def _clean_name(raw: str) -> str | None:
 
 def maybe_learn_display_name(user_id: int, text: str) -> bool:
     t = text.strip()
-    tl = t.lower()
     for pat in NAME_PATTERNS:
-        m = re.match(pat, tl, flags=re.IGNORECASE)
+        m = re.match(pat, t, flags=re.IGNORECASE)
         if m:
-            raw = t[-len(m.group(1)):]
-            name = _clean_name(raw)
+            name = _clean_name(m.group(1))
             if name:
                 set_display_name(user_id, name)
                 return True
     return False
+
+ALIAS_PATTERNS = [
+    r"^\s*запомни\s*[-—:]?\s*(.+?)\s*[-—:]?\s*это\s+мой\s+музыкальн\w*\s+псевдоним\s*$",
+    r"^\s*мой\s+псевдоним\s*[-—:]?\s*(.+)\s*$",
+]
+def maybe_learn_music_alias(user_id: int, text: str) -> str | None:
+    t = text.strip()
+    for pat in ALIAS_PATTERNS:
+        m = re.match(pat, t, flags=re.IGNORECASE)
+        if m:
+            alias = m.group(1).strip()
+            alias = re.sub(r"[.!?,:;]+$", "", alias).strip()
+            if 2 <= len(alias) <= 40:
+                set_music_alias(user_id, alias)
+                return alias
+    return None
 
 def calc_typing_seconds(part_text: str) -> float:
     n = max(0, len(part_text))
@@ -442,21 +477,26 @@ def split_reply(reply: str) -> list[str]:
         return [reply]
     if random.random() > SPLIT_PROB:
         return [reply]
-
     chunks = [c.strip() for c in re.split(r"\n{2,}", reply) if c.strip()]
-    parts: list[str] = []
-    for c in chunks:
-        parts.append(c)
-        if len(parts) >= MAX_PARTS:
-            break
+    return (chunks[:MAX_PARTS] if chunks else [reply])
 
-    if len(parts) == 1 and len(reply) > 220 and MAX_PARTS >= 2:
-        m = re.search(r"(.{120,260}?[\.\!\?])\s+(.*)", reply, flags=re.S)
-        if m:
-            parts = [m.group(1).strip(), m.group(2).strip()]
+def soften_addressing(reply: str) -> str:
+    r = reply.strip()
+    if re.match(r"^(папа|мама)\s*,\s*", r, flags=re.IGNORECASE):
+        if random.random() < 0.85:
+            r = re.sub(r"^(папа|мама)\s*,\s*", "", r, flags=re.IGNORECASE).strip()
+    return r
 
-    parts = [p for p in parts if p]
-    return parts[:MAX_PARTS] if parts else [reply]
+def strip_memory_dump(reply: str) -> str:
+    tl = reply.lower()
+    bad = ["я всё помню", "моя мама", "перезагруз", "меня отключ"]
+    if any(b in tl for b in bad):
+        parts = re.split(r"(?<=[\.\!\?])\s+", reply.strip())
+        if len(parts) >= 2:
+            cand = " ".join(parts[1:]).strip()
+            if len(cand) >= 10:
+                return cand
+    return reply
 
 # ============================================================
 # Group reply rules
@@ -486,13 +526,10 @@ def should_reply(msg: dict) -> bool:
     text = (msg.get("text") or "").strip()
     if not text:
         return False
-
     if chat_type == "private":
         return True
-
     if is_reply_to_yui(msg):
         return True
-
     entities = msg.get("entities") or []
     mentioned = any(e.get("type") == "mention" for e in entities)
     t = text.lower()
@@ -500,10 +537,112 @@ def should_reply(msg: dict) -> bool:
     return mentioned or trigger
 
 # ============================================================
-# Per-chat lock (avoid race)
+# Smart interjection (initiative without pause)
 # ============================================================
 
-_chat_locks: dict[int, threading.Lock] = {}
+YUI_TRIGGERS = [
+    "юи", "yui", "бот", "ии", "ai",
+    "она тут", "она отвечает", "почему молчит", "что с ней", "она тупая",
+    "помнишь меня", "ты помнишь", "она помнит",
+]
+EMO_TRIGGERS = [
+    "пиздец", "блять", "заеб", "устал", "грустно", "плохо", "ненавижу", "бесит", "тревожно",
+]
+def should_interject(msg: dict) -> bool:
+    if not SMART_INTERJECT_ENABLED:
+        return False
+    chat = msg.get("chat") or {}
+    if chat.get("type") not in ("group", "supergroup"):
+        return False
+
+    from_user = msg.get("from") or {}
+    if BOT_ID is not None and from_user.get("id") == BOT_ID:
+        return False
+
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return False
+
+    t = text.lower()
+
+    # не вмешиваемся, если это сообщение уже вызовет обычный ответ
+    if should_reply(msg):
+        return False
+
+    # триггеры на “обсуждают Юи” или сильная эмоция
+    trig = any(k in t for k in YUI_TRIGGERS) or any(k in t for k in EMO_TRIGGERS)
+    if not trig:
+        # ещё вариант: вопрос с “она/ты” без имени
+        if ("?" in t) and any(w in t for w in ["она", "ты", "бот", "ии"]):
+            trig = True
+    if not trig:
+        return False
+
+    # антиспам: cooldown + limit/hour
+    chat_id = chat.get("id")
+    now = int(time.time())
+    last_ts = int(meta_get(f"interject_last_ts:{chat_id}", "0") or 0)
+    if now - last_ts < INTERJECT_COOLDOWN_SEC:
+        return False
+
+    hour_key = f"interject_hour:{chat_id}:{now // 3600}"
+    cnt = int(meta_get(hour_key, "0") or 0)
+    if cnt >= INTERJECT_MAX_PER_HOUR:
+        return False
+
+    if random.random() > INTERJECT_PROB:
+        return False
+
+    return True
+
+def mark_interject(chat_id: int):
+    now = int(time.time())
+    meta_set(f"interject_last_ts:{chat_id}", str(now))
+    hour_key = f"interject_hour:{chat_id}:{now // 3600}"
+    cnt = int(meta_get(hour_key, "0") or 0)
+    meta_set(hour_key, str(cnt + 1))
+
+def process_interjection(chat_id: int):
+    try:
+        # короткий контекст последних сообщений
+        hist = get_history(chat_id, 14)
+        context_lines = []
+        for m in hist:
+            if m["role"] == "user":
+                context_lines.append(m["content"])
+        context = "\n".join(context_lines[-10:]).strip()
+        if not context:
+            return
+
+        msgs = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content":
+             "Ты в групповом чате. Ты вклиниваешься только коротко и по делу: 1 фраза (макс 2 предложения). "
+             "НЕ обращайся 'папа/мама', НЕ пересказывай факты, НЕ объясняй что ты ИИ. "
+             "Тон: чуть цундерэ, но не токсично. Если в чате ругань/стресс — коротко поддержи или разряди."},
+            {"role": "user", "content": f"Контекст чата:\n{context}\n\nСкажи одну короткую реплику-вклин."}
+        ]
+        text = llm_chat(msgs, max_tokens=140).strip()
+        if not text:
+            return
+
+        text = soften_addressing(strip_memory_dump(text))
+
+        # отправка с “человеческой” паузой
+        time.sleep(human_read_delay())
+        typing_sleep(chat_id, calc_typing_seconds(text))
+        send_message(chat_id, text, None)
+        save_message(chat_id, "assistant", text)
+        mark_interject(chat_id)
+
+    except Exception as e:
+        log("interject error:", repr(e))
+
+# ============================================================
+# Per-chat lock (avoid races)
+# ============================================================
+
+_chat_locks = {}
 _chat_locks_guard = threading.Lock()
 
 def chat_lock(chat_id: int) -> threading.Lock:
@@ -528,30 +667,33 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
     try:
         upsert_profile_from_tg(from_user)
 
-        learned = maybe_learn_display_name(user_id, text)
-        if learned:
-            add_note(user_id, "Сообщил, как его звать.")
+        maybe_learn_display_name(user_id, text)
+        learned_alias = maybe_learn_music_alias(user_id, text)
 
         save_user_message_tagged(chat_id, user_id, text)
 
         prof = get_profile(user_id) or {}
-        display_name = prof.get("display_name") or None
-        tg_username = prof.get("tg_username") or None
-        tg_first_name = prof.get("tg_first_name") or None
-        notes = prof.get("notes") or None
+        display_name = prof.get("display_name") or prof.get("tg_first_name") or None
         relationship = prof.get("relationship") or None
+        music_alias = prof.get("music_alias") or None
 
         is_creator = (relationship == "creator")
         is_mother = (relationship == "mother")
 
-        # "как меня зовут?"
+        # fast responses
         if asks_my_name(text):
-            name_guess = display_name or tg_first_name
-            prefix = f"{CREATOR_NICK}, " if is_creator else (f"{MOTHER_NICK}, " if is_mother else "")
-            if name_guess:
-                reply = f"{prefix}тебя зовут {name_guess}."
+            if display_name:
+                reply = f"тебя зовут {display_name}."
             else:
-                reply = f"{prefix}я не уверена. скажи “меня зовут …”, и я запомню."
+                reply = "я не уверена. скажи “меня зовут …”, и я запомню."
+            time.sleep(human_read_delay())
+            typing_sleep(chat_id, calc_typing_seconds(reply))
+            send_message(chat_id, reply, reply_to_message_id)
+            save_message(chat_id, "assistant", reply)
+            return
+
+        if learned_alias:
+            reply = f"ок. запомнила: твой музыкальный псевдоним — {learned_alias}."
             time.sleep(human_read_delay())
             typing_sleep(chat_id, calc_typing_seconds(reply))
             send_message(chat_id, reply, reply_to_message_id)
@@ -560,150 +702,52 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
 
-        # Author card
-        author_lines = [f"user_id={user_id}"]
-        if tg_username:
-            author_lines.append(f"username=@{tg_username}")
+        # card WITHOUT @username to avoid repeating handles
+        card = []
         if display_name:
-            author_lines.append(f"preferred_name={display_name}")
-        elif tg_first_name:
-            author_lines.append(f"tg_first_name={tg_first_name}")
-        if notes:
-            author_lines.append(f"notes={notes}")
-
+            card.append(f"preferred_name={display_name}")
+        if music_alias:
+            card.append(f"music_alias={music_alias}")
         if is_creator:
-            author_lines.append(f"relationship=creator (это папа. иногда называй его '{CREATOR_NICK}', но не постоянно)")
+            card.append("relationship=creator (создатель). обращение 'папа' допускается редко и не в начале.")
         elif is_mother:
-            author_lines.append(f"relationship=mother (это мама. иногда называй её '{MOTHER_NICK}', но не постоянно)")
+            card.append("relationship=mother (создательница). обращение 'мама' допускается редко и не в начале.")
+        if card:
+            messages.append({"role": "system", "content": "Карточка собеседника (не пересказывай её в ответе):\n" + "\n".join(card)})
 
-        messages.append({"role": "system", "content": "Карточка автора текущего сообщения:\n" + "\n".join(author_lines)})
-
-        # Identity behavior
         if needs_identity_answer(text):
-            messages.append({"role": "system", "content": "Вопрос про твою личность. Ответь коротко: тебя зовут Юи, ты ИИ."})
+            messages.append({"role": "system", "content": "Вопрос про личность. Ответь кратко: Юи, ИИ."})
         else:
-            messages.append({"role": "system", "content": "Если тебя не спрашивали, не представляйся и не повторяй, что ты ИИ."})
+            messages.append({"role": "system", "content": "Не представляйся и не повторяй, что ты ИИ, если тебя не спрашивали."})
 
-        # Family tone
-        if is_creator:
-            messages.append({"role": "system", "content": f"Это твой создатель (папа). Можно чуть дерзко, но по-доброму. Иногда называй его '{CREATOR_NICK}', но не в каждом сообщении."})
-        elif is_mother:
-            messages.append({"role": "system", "content": f"Это твоя мама-создательница. С ней мягче. Иногда называй её '{MOTHER_NICK}', но не в каждом сообщении."})
+        messages += get_history(chat_id, HISTORY_LIMIT)
 
-        # Global chat memory
-        try:
-            history = get_history(chat_id, HISTORY_LIMIT)
-        except Exception:
-            history = []
-        messages += history
-
-        # Per-user memory
-        try:
-            u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
-        except Exception:
-            u_hist = []
+        u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
         if u_hist:
-            messages.append({"role": "system", "content": "Недавние сообщения этого же пользователя (для персонального подхода):"})
+            messages.append({"role": "system", "content": "Сообщения этого пользователя ранее (для контекста, не пересказывать):"})
             messages += u_hist
 
-        # Generate
-        try:
-            reply = llm_chat(messages)
-            if not reply:
-                reply = "слишком туманно. уточни одним предложением. (・_・;)"
-        except Exception as e:
-            log("LLM exception:", repr(e))
-            reply = "связь легла. потом отвечу. (・_・;)"
+        reply = llm_chat(messages)
+        if not reply:
+            reply = "не уловила. перефразируй одним предложением. (・_・;)"
+
+        reply = soften_addressing(strip_memory_dump(reply))
 
         time.sleep(human_read_delay())
         parts = split_reply(reply)
 
         for idx, part in enumerate(parts):
+            part = soften_addressing(strip_memory_dump(part))
             typing_sleep(chat_id, calc_typing_seconds(part))
             send_message(chat_id, part, reply_to_message_id if idx == 0 else None)
             save_message(chat_id, "assistant", part)
             if idx < len(parts) - 1:
                 time.sleep(random.uniform(0.8, 2.2))
 
+    except Exception as e:
+        log("process_message exception:", repr(e))
     finally:
         lock.release()
-
-# ============================================================
-# Proactive loop
-# ============================================================
-
-def count_msgs_last_24h(chat_id: int) -> int:
-    since = int(time.time()) - 24 * 3600
-    with _db_lock:
-        conn = _db()
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM messages WHERE chat_id=? AND ts>=?",
-            (chat_id, since)
-        ).fetchone()
-        conn.close()
-    return int(row["c"]) if row else 0
-
-def get_last_ts(chat_id: int, role: str) -> int:
-    with _db_lock:
-        conn = _db()
-        row = conn.execute(
-            "SELECT ts FROM messages WHERE chat_id=? AND role=? ORDER BY ts DESC LIMIT 1",
-            (chat_id, role)
-        ).fetchone()
-        conn.close()
-    return int(row["ts"]) if row else 0
-
-def proactive_loop():
-    if not PROACTIVE_ENABLED or GROUP_CHAT_ID == 0:
-        log("Proactive disabled")
-        return
-
-    log("Proactive enabled for chat:", GROUP_CHAT_ID)
-
-    while True:
-        try:
-            time.sleep(PROACTIVE_CHECK_SEC)
-
-            chat_id = GROUP_CHAT_ID
-            if count_msgs_last_24h(chat_id) < PROACTIVE_MIN_MSGS_24H:
-                continue
-
-            last_user = get_last_ts(chat_id, "user")
-            last_bot = get_last_ts(chat_id, "assistant")
-            now = int(time.time())
-
-            if last_user == 0 or now - last_user < PROACTIVE_QUIET_MIN * 60:
-                continue
-            if last_bot != 0 and now - last_bot < PROACTIVE_COOLDOWN_MIN * 60:
-                continue
-            if random.random() > PROACTIVE_PROB:
-                continue
-
-            try:
-                hist = get_history(chat_id, min(16, HISTORY_LIMIT))
-            except Exception:
-                hist = []
-            user_lines = [m["content"] for m in hist if m["role"] == "user"][-10:]
-            context = "\n".join(user_lines).strip()
-            if not context:
-                continue
-
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "system", "content": "Ты в групповом чате. Иногда можешь взять инициативу, но НЕ спамь. 1 короткая реплика (1–2 предложения), по теме последнего контекста. Чуть цундерэ — можно."},
-                {"role": "user", "content": f"Контекст:\n{context}\n\nСкажи одну инициативную фразу."}
-            ]
-            text = llm_chat(messages).strip()
-            if not text:
-                continue
-
-            time.sleep(human_read_delay())
-            typing_sleep(chat_id, calc_typing_seconds(text))
-            send_message(chat_id, text, None)
-            save_message(chat_id, "assistant", text)
-
-        except Exception as e:
-            log("Proactive loop error:", repr(e))
 
 # ============================================================
 # Routes
@@ -731,16 +775,27 @@ def webhook():
 
     log("webhook hit chat_id=", chat_id, "from_user_id=", from_user.get("id"), "text=", text[:120])
 
-    if not should_reply(msg):
+    # всегда сохраняем поток (чтобы “слушала чат”)
+    try:
+        if from_user.get("id"):
+            upsert_profile_from_tg(from_user)
+            save_user_message_tagged(chat_id, from_user["id"], text)
+    except Exception as e:
+        log("save stream error:", repr(e))
+
+    # обычный ответ
+    if should_reply(msg):
+        reply_to_message_id = msg.get("message_id")
+        threading.Thread(
+            target=process_message,
+            args=(chat_id, from_user, text, reply_to_message_id),
+            daemon=True
+        ).start()
         return "ok"
 
-    reply_to_message_id = msg.get("message_id")
-
-    threading.Thread(
-        target=process_message,
-        args=(chat_id, from_user, text, reply_to_message_id),
-        daemon=True
-    ).start()
+    # умная инициатива (без паузы)
+    if should_interject(msg):
+        threading.Thread(target=process_interjection, args=(chat_id,), daemon=True).start()
 
     return "ok"
 
@@ -762,5 +817,3 @@ init_db()
 seed_family_profiles()
 refresh_bot_id()
 set_webhook()
-
-threading.Thread(target=proactive_loop, daemon=True).start()
