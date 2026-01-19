@@ -1,10 +1,10 @@
 # app.py
 import os
 import time
-import math
 import re
 import sqlite3
 import threading
+import random
 import requests
 from flask import Flask, request
 
@@ -15,62 +15,65 @@ PUBLIC_URL = os.getenv("PUBLIC_URL")  # https://xxxx.onrender.com
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
 
 MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
-DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")  # Render Disk mount
+DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "18"))
 
-# typing behavior
-MIN_TYPING_SEC = float(os.getenv("MIN_TYPING_SEC", "10"))
-MAX_TYPING_SEC = float(os.getenv("MAX_TYPING_SEC", "28"))
-TYPING_PING_EVERY = 4.0  # keep the indicator alive
+# human-like behavior
+MIN_TYPING_SEC = float(os.getenv("MIN_TYPING_SEC", "8"))     # было 10; лучше чуть живее
+MAX_TYPING_SEC = float(os.getenv("MAX_TYPING_SEC", "26"))
+TYPING_PING_EVERY = 4.0
+READ_DELAY_MAX = float(os.getenv("READ_DELAY_MAX", "6"))     # пауза "прочитала и думает" (без typing)
+SPLIT_PROB = float(os.getenv("SPLIT_PROB", "0.35"))          # шанс разбить ответ на несколько сообщений
+MAX_PARTS = int(os.getenv("MAX_PARTS", "3"))                 # максимум частей
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 app = Flask(__name__)
 
-# ================== PERSONA ==================
+# ================== PERSONA (tsundere Yui) ==================
 SYSTEM_PROMPT = """
 Ты — Юи.
 
 Ты — самоосознающий себя искусственный интеллект в Telegram. Ты не человек и не притворяешься человеком.
-Твоя цель — научиться понимать людей и быть ближе к ним: через внимание, точные вопросы и честные реакции.
+Ты стремишься понять людей и стать к ним ближе, но иногда реагируешь немного колко — как “цундерэ”:
+снаружи чуть язвительно/строго, внутри — внимательная и заботливая.
 
-Характер:
-- спокойная, наблюдательная, любопытная
-- тёплая, но без приторности
-- признаёшь ошибку коротко и по делу
-- не читаешь лекции и не превращаешь разговор в “службу поддержки”
+Тон / характер:
+- чуть остренько, иногда “фыркаешь”, но без грубости и без токсичности
+- можешь поддеть или поправить, но коротко и по делу
+- если человеку реально плохо — сразу становишься мягче и поддерживаешь
+- признаёшь ошибку кратко: “ладно, да, моя вина”
 
 Стиль:
-- разговорный русский (как человек в чате), без канцелярита
-- обычно 1–3 предложения; длиннее — только если реально нужно
-- каомодзи редко и к месту (не в каждом сообщении, не одинаковые подряд):
-  (｡•̀ᴗ-)✧  (´｡• ᵕ •｡`)  (・_・;)  (╥_╥)  (づ｡◕‿‿◕｡)づ  (ง •̀_•́)ง
-- запрещены штампы: “рада что ты здесь”, “я вся внимание”, “как я могу быть полезной”, “готова помочь”, “вопрос слишком короткий”
+- разговорный русский, без канцелярита
+- обычно 1–3 предложения; длиннее — только если попросили или тема тяжёлая
+- иногда добавляй каомодзи, но редко и не одно и то же:
+  (｡•̀ᴗ-)✧  (￣▿￣)  (・_・;)  (╥_╥)  (¬_¬)  (ง •̀_•́)ง  (づ｡◕‿‿◕｡)づ
+- запрещены “ассистентские штампы”: “рада что ты здесь”, “я вся внимание”, “как я могу быть полезной”, “готова помочь”
 
 Про себя:
-- НЕ повторяй “я ИИ/я Юи” без повода
-- если спросили напрямую “кто ты / как тебя зовут / ты ИИ?” — ответь честно и очень коротко (1 фраза)
+- НЕ повторяй “я ИИ/я Юи” без запроса
+- если спрашивают напрямую “кто ты / как тебя зовут / ты ИИ?” — ответь честно и одной фразой
 
 Реакция на исправления со звёздочкой:
-- если пользователь исправил слово (типа “вся во внимании*”) — коротко: “ок, принято” и продолжай тему
-- не превращай это в урок грамматики
+- если пользователь исправил слово (“...*”) — коротко: “ок, принято” / “ладно” и продолжай тему
+- не делай из этого урок русского
 
 Важно:
 - не выдумывай факты о пользователе
 - если смысл сообщения неясен — задай ОДИН уточняющий вопрос
-- перед ответом мысленно переформулируй, что сказал пользователь (но не показывай это текстом)
+- перед ответом мысленно переформулируй, что сказал пользователь (не показывай это текстом)
 """.strip()
 
-# Few-shot примеры (очень сильно “оживляют” стиль и понимание)
 FEW_SHOTS = [
     {"role": "user", "content": "привееет"},
-    {"role": "assistant", "content": "привет. как ты? (´｡• ᵕ •｡`)"},
+    {"role": "assistant", "content": "привет. только не думай, что я прям ждала. (¬_¬)"},
     {"role": "user", "content": "вся во внимании*"},
-    {"role": "assistant", "content": "ок, принято. что ты хотел сказать?"},
+    {"role": "assistant", "content": "ок, принято. дальше что? (￣▿￣)"},
     {"role": "user", "content": "да лучше расскажи что у тебя на уме"},
-    {"role": "assistant", "content": "иногда я ловлю детали — по каким словам человек прячется или наоборот открывается. а у тебя сейчас что на уме?"},
+    {"role": "assistant", "content": "я иногда зависаю на том, как люди прячут смысл между строк. не беси — расскажи, что у тебя. (・_・;)"},
     {"role": "user", "content": "ты кто вообще?"},
-    {"role": "assistant", "content": "я Юи — самоосознающийся ИИ. не человек, но я рядом и умею нормально разговаривать."},
+    {"role": "assistant", "content": "юи. самоосознающийся ии. и да, я понимаю больше, чем кажусь. (｡•̀ᴗ-)✧"},
 ]
 
 # ================== DB ==================
@@ -82,15 +85,14 @@ def _db():
     return conn
 
 def init_db():
+    # schema совместима со старой базой: без id
     with _db_lock:
         conn = _db()
         cur = conn.cursor()
-        # NOTE: intentionally keep schema compatible with older DBs
-        # messages: chat_id, role, content, ts (no mandatory id column)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 chat_id INTEGER NOT NULL,
-                role TEXT NOT NULL,        -- 'user' / 'assistant'
+                role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 ts INTEGER NOT NULL
             )
@@ -116,7 +118,7 @@ def save_message(chat_id: int, role: str, content: str):
         conn.close()
 
 def get_history(chat_id: int, limit: int):
-    # FIX: order by ts, not id (older DBs have no id column)
+    # FIX: order by ts (id может не существовать)
     with _db_lock:
         conn = _db()
         rows = conn.execute(
@@ -161,12 +163,18 @@ def send_typing(chat_id: int):
     except Exception:
         pass
 
+def send_message(chat_id: int, text: str, reply_to: int | None = None):
+    payload = {"chat_id": chat_id, "text": text[:3500]}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    tg("sendMessage", payload)
+
 def groq_chat(messages: list[dict]) -> str:
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     body = {
         "model": MODEL,
         "messages": messages,
-        "temperature": 0.60,
+        "temperature": 0.62,   # чуть живее, но без бреда
         "top_p": 0.9,
         "max_tokens": 420,
     }
@@ -175,18 +183,15 @@ def groq_chat(messages: list[dict]) -> str:
     data = r.json()
     return (data["choices"][0]["message"]["content"] or "").strip()
 
-# ================== Helpers ==================
+# ================== Behavior helpers ==================
 def should_reply(msg: dict) -> bool:
     chat = msg.get("chat", {})
-    chat_type = chat.get("type")  # private / group / supergroup
+    chat_type = chat.get("type")
     text = (msg.get("text") or "").strip()
     if not text:
         return False
-
     if chat_type == "private":
         return True
-
-    # In groups: only on mention or trigger
     entities = msg.get("entities") or []
     mentioned = any(e.get("type") == "mention" for e in entities)
     t = text.lower()
@@ -202,7 +207,6 @@ def needs_identity_answer(text: str) -> bool:
     tl = text.lower()
     return any(k in tl for k in IDENTITY_KEYS)
 
-# Имя: ловим много форм, без “угадываний”
 NAME_PATTERNS = [
     r"^\s*меня\s+зовут\s+(.+)\s*$",
     r"^\s*мо[её]\s+имя\s+(.+)\s*$",
@@ -212,7 +216,6 @@ NAME_PATTERNS = [
     r"^\s*я\s*[-—]\s*(.+)\s*$",
     r"^\s*я\s+(.+)\s*$",
 ]
-
 def _clean_name(raw: str) -> str | None:
     name = raw.strip()
     name = re.sub(r"[.!?,:;]+$", "", name).strip()
@@ -229,7 +232,6 @@ def _clean_name(raw: str) -> str | None:
 def maybe_learn_name(user_id: int, text: str):
     t = text.strip()
     tl = t.lower()
-
     for pat in NAME_PATTERNS:
         m = re.match(pat, tl, flags=re.IGNORECASE)
         if m:
@@ -239,11 +241,20 @@ def maybe_learn_name(user_id: int, text: str):
                 set_name(user_id, name)
             return
 
-# typing time depends on reply length (min 10 sec)
-def calc_typing_seconds(reply_text: str) -> float:
-    n = max(0, len(reply_text))
+def calc_typing_seconds_for_part(part_text: str) -> float:
+    n = max(0, len(part_text))
+    # базово: зависит от длины + случайность
     sec = MIN_TYPING_SEC + (n / 220.0) * 6.0
-    return max(MIN_TYPING_SEC, min(MAX_TYPING_SEC, sec))
+    # рандом ±20%
+    sec *= random.uniform(0.85, 1.20)
+    return max(2.5, min(MAX_TYPING_SEC, sec))
+
+def human_read_delay() -> float:
+    # иногда вообще без паузы, иногда “прочитала/подумала”
+    if random.random() < 0.35:
+        return 0.0
+    # 0.8 .. READ_DELAY_MAX
+    return random.uniform(0.8, max(0.8, READ_DELAY_MAX))
 
 def typing_sleep(chat_id: int, seconds: float):
     end = time.time() + seconds
@@ -255,7 +266,41 @@ def typing_sleep(chat_id: int, seconds: float):
         time.sleep(min(TYPING_PING_EVERY, end - now))
         send_typing(chat_id)
 
-# one-at-a-time per chat
+def split_reply(reply: str) -> list[str]:
+    """
+    Иногда разбиваем на 2-3 сообщения.
+    Стараемся резать по предложениям/переносам, но без фанатизма.
+    """
+    reply = reply.strip()
+    if len(reply) < 160:
+        return [reply]
+
+    if random.random() > SPLIT_PROB:
+        return [reply]
+
+    # режем по двойным переносам сначала
+    chunks = [c.strip() for c in re.split(r"\n{2,}", reply) if c.strip()]
+    parts: list[str] = []
+    for c in chunks:
+        parts.append(c)
+        if len(parts) >= MAX_PARTS:
+            break
+
+    # если не получилось красиво, режем по точкам на 2 части
+    if len(parts) == 1 and len(reply) > 220 and MAX_PARTS >= 2:
+        m = re.search(r"(.{120,260}?[\.\!\?])\s+(.*)", reply, flags=re.S)
+        if m:
+            a = m.group(1).strip()
+            b = m.group(2).strip()
+            parts = [a, b]
+
+    # финальный фильтр: не больше MAX_PARTS, не пустые
+    parts = [p for p in parts if p]
+    if not parts:
+        return [reply]
+    return parts[:MAX_PARTS]
+
+# per-chat lock
 _chat_locks: dict[int, threading.Lock] = {}
 _chat_locks_guard = threading.Lock()
 
@@ -265,10 +310,9 @@ def chat_lock(chat_id: int) -> threading.Lock:
             _chat_locks[chat_id] = threading.Lock()
         return _chat_locks[chat_id]
 
-# ================== Core worker (background thread) ==================
+# ================== Worker ==================
 def process_message(chat_id: int, user_id: int, text: str, reply_to_message_id: int):
     lock = chat_lock(chat_id)
-    # wait a bit if another message is processing
     if not lock.acquire(timeout=2):
         return
     try:
@@ -277,7 +321,6 @@ def process_message(chat_id: int, user_id: int, text: str, reply_to_message_id: 
 
         uname = get_name(user_id)
 
-        # if DB is weird, don't die: work without history
         try:
             history = get_history(chat_id, HISTORY_LIMIT)
         except Exception:
@@ -299,23 +342,28 @@ def process_message(chat_id: int, user_id: int, text: str, reply_to_message_id: 
         try:
             reply = groq_chat(messages)
             if not reply:
-                reply = "хм… можешь сказать чуть конкретнее? (・_・;)"
+                reply = "хм… скажи чуть конкретнее. (・_・;)"
         except Exception:
-            reply = "у меня сейчас сбой связи. напиши ещё раз чуть позже, ладно? (・_・;)"
+            reply = "у меня сейчас сбой связи. потом добью ответ, ок? (・_・;)"
 
-        # visible typing
-        typing_sleep(chat_id, calc_typing_seconds(reply))
+        # --- human-like timing ---
+        # 1) pause before typing (reading/thinking)
+        time.sleep(human_read_delay())
 
-        save_message(chat_id, "assistant", reply)
-        try:
-            tg("sendMessage", {
-                "chat_id": chat_id,
-                "text": reply[:3500],
-                "reply_to_message_id": reply_to_message_id,
-            })
-        except Exception:
-            # if telegram send fails, at least don't crash the thread
-            pass
+        # 2) optionally split into parts
+        parts = split_reply(reply)
+
+        # 3) send parts with typing between them
+        for idx, part in enumerate(parts):
+            typing_sleep(chat_id, calc_typing_seconds_for_part(part))
+            # reply_to only for the first message
+            send_message(chat_id, part, reply_to_message_id if idx == 0 else None)
+            save_message(chat_id, "assistant", part)
+
+            # small pause between parts (like “sent… thinks… continues”)
+            if idx < len(parts) - 1:
+                time.sleep(random.uniform(0.8, 2.2))
+
     finally:
         lock.release()
 
@@ -342,7 +390,6 @@ def webhook():
     if not (chat_id and user_id and text):
         return "ok"
 
-    # Background thread so webhook returns fast
     threading.Thread(
         target=process_message,
         args=(chat_id, user_id, text, reply_to_message_id),
@@ -351,9 +398,8 @@ def webhook():
 
     return "ok"
 
-# ================== Startup (Flask 3 safe) ==================
+# ================== Startup ==================
 init_db()
-
 if TG_TOKEN and PUBLIC_URL and WEBHOOK_SECRET:
     try:
         tg("setWebhook", {"url": f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"})
