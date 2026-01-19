@@ -17,14 +17,14 @@ MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
 DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
 
 # bigger memory by default
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "40"))          # group history in prompt
-USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "14")) # per-user history in prompt
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "40"))
+USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "14"))
 
 # Creator settings
 CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "0"))
 CREATOR_NICK = os.getenv("CREATOR_NICK", "папа")
 
-# group proactive mode
+# group proactive mode (optional)
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
 PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "0") == "1"
 PROACTIVE_CHECK_SEC = int(os.getenv("PROACTIVE_CHECK_SEC", "60"))
@@ -104,7 +104,7 @@ def init_db():
         conn = _db()
         cur = conn.cursor()
 
-        # messages (compatible with old schema)
+        # messages
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 chat_id INTEGER NOT NULL,
@@ -113,25 +113,29 @@ def init_db():
                 ts INTEGER NOT NULL
             )
         """)
-        # if ts missing in older versions, add it
-        ensure_columns(conn, "messages", {"ts": "INTEGER"})
+        ensure_columns(conn, "messages", {
+            "chat_id": "INTEGER",
+            "role": "TEXT",
+            "content": "TEXT",
+            "ts": "INTEGER"
+        })
 
-        # profiles (older versions might have: user_id, name, updated_at)
+        # profiles (create minimal if missing)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS profiles (
-                user_id INTEGER PRIMARY KEY,
-                name TEXT,
-                updated_at INTEGER NOT NULL
+                user_id INTEGER PRIMARY KEY
             )
         """)
-        # migrate/add new columns safely
+        # IMPORTANT: migrate EVERYTHING we rely on, including updated_at
         ensure_columns(conn, "profiles", {
+            "name": "TEXT",                 # legacy
             "tg_username": "TEXT",
             "tg_first_name": "TEXT",
             "tg_last_name": "TEXT",
             "display_name": "TEXT",
             "notes": "TEXT",
-            "relationship": "TEXT"
+            "relationship": "TEXT",
+            "updated_at": "INTEGER"
         })
 
         cur.execute("""
@@ -165,17 +169,16 @@ def get_history(chat_id: int, limit: int):
     rows = list(reversed(rows))
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
+def save_user_message_tagged(chat_id: int, user_id: int, text: str):
+    save_message(chat_id, "user", text)
+    save_message(chat_id, "user", f"[u:{user_id}] {text}")
+
 def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
-    """
-    Лёгкий хак: мы сохраняем user-сообщения в messages без user_id (исторически),
-    поэтому перс.историю берём через отдельный "псевдо-канал" в content:
-    мы будем сохранять user сообщения с префиксом [u:<id>] (см. below).
-    """
     tag = f"[u:{user_id}] "
     with _db_lock:
         conn = _db()
         rows = conn.execute(
-            "SELECT role, content FROM messages WHERE chat_id=? AND role='user' AND content LIKE ? ORDER BY ts DESC LIMIT ?",
+            "SELECT content FROM messages WHERE chat_id=? AND role='user' AND content LIKE ? ORDER BY ts DESC LIMIT ?",
             (chat_id, tag + "%", limit)
         ).fetchall()
         conn.close()
@@ -188,12 +191,6 @@ def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
         cleaned.append({"role": "user", "content": c})
     return cleaned
 
-def save_user_message_tagged(chat_id: int, user_id: int, text: str):
-    # сохраняем обычную историю (без тега) для “общего чата”
-    save_message(chat_id, "user", text)
-    # и сохраняем вторую запись с тегом для персональной выборки
-    save_message(chat_id, "user", f"[u:{user_id}] {text}")
-
 def upsert_profile_from_tg(user: dict):
     user_id = user.get("id")
     if not user_id:
@@ -202,9 +199,11 @@ def upsert_profile_from_tg(user: dict):
     first_name = user.get("first_name")
     last_name = user.get("last_name")
     rel = "creator" if (CREATOR_USER_ID and user_id == CREATOR_USER_ID) else None
+    ts = int(time.time())
 
     with _db_lock:
         conn = _db()
+        # NOTE: use COALESCE to keep existing relationship if already set
         conn.execute("""
             INSERT INTO profiles (user_id, tg_username, tg_first_name, tg_last_name, relationship, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -214,7 +213,7 @@ def upsert_profile_from_tg(user: dict):
               tg_last_name=excluded.tg_last_name,
               relationship=COALESCE(profiles.relationship, excluded.relationship),
               updated_at=excluded.updated_at
-        """, (user_id, username, first_name, last_name, rel, int(time.time())))
+        """, (user_id, username, first_name, last_name, rel, ts))
         conn.commit()
         conn.close()
 
@@ -290,14 +289,14 @@ def groq_chat(messages: list[dict]) -> str:
         "messages": messages,
         "temperature": 0.62,
         "top_p": 0.9,
-        "max_tokens": 520,  # чуть больше, чтобы хватало “ума”
+        "max_tokens": 520,
     }
     r = requests.post(GROQ_URL, headers=headers, json=body, timeout=60)
     r.raise_for_status()
     data = r.json()
     return (data["choices"][0]["message"]["content"] or "").strip()
 
-# ================== Logic helpers ==================
+# ================== Helpers ==================
 IDENTITY_KEYS = [
     "кто ты", "ты кто",
     "как тебя зовут", "тебя зовут", "как звать",
@@ -314,7 +313,7 @@ def asks_my_name(text: str) -> bool:
 
 NAME_PATTERNS = [
     r"^\s*меня\s+зовут\s+(.+)\s*$",
-    r"^\s*мо[её]\s+имя\s+(.+)\s*$",
+    r"^\s*мо[eё]\s+имя\s+(.+)\s*$",
     r"^\s*имя\s*[:\-]?\s*(.+)\s*$",
     r"^\s*зови\s+меня\s+(.+)\s*$",
     r"^\s*можешь\s+звать\s+меня\s+(.+)\s*$",
@@ -452,7 +451,6 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         if learned:
             add_note(user_id, "Сообщил, как его звать.")
 
-        # save tagged + group history
         save_user_message_tagged(chat_id, user_id, text)
 
         prof = get_profile(user_id) or {}
@@ -464,27 +462,18 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
 
         is_creator = (CREATOR_USER_ID and user_id == CREATOR_USER_ID)
 
-        # quick direct answer: "как меня зовут?"
         if asks_my_name(text):
             name_guess = display_name or tg_first_name
-            if is_creator:
-                prefix = f"{CREATOR_NICK}, "
-            else:
-                prefix = ""
-            if name_guess:
-                reply = f"{prefix}тебя зовут {name_guess}."
-            else:
-                reply = f"{prefix}я не уверена. скажи “меня зовут …”, и я запомню."
+            prefix = f"{CREATOR_NICK}, " if is_creator else ""
+            reply = f"{prefix}тебя зовут {name_guess}." if name_guess else f"{prefix}я не уверена. скажи “меня зовут …”, и я запомню."
             time.sleep(human_read_delay())
             typing_sleep(chat_id, calc_typing_seconds(reply))
             send_message(chat_id, reply, reply_to_message_id)
             save_message(chat_id, "assistant", reply)
             return
 
-        # prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
 
-        # author card
         author_lines = [f"user_id={user_id}"]
         if tg_username:
             author_lines.append(f"username=@{tg_username}")
@@ -504,16 +493,14 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             messages.append({"role": "system", "content": "Если тебя не спрашивали, не представляйся и не повторяй, что ты ИИ."})
 
         if is_creator:
-            messages.append({"role": "system", "content": f"Это твой создатель. Время от времени называй его '{CREATOR_NICK}'."})
+            messages.append({"role": "system", "content": f"Это твой создатель. Иногда называй его '{CREATOR_NICK}'."})
 
-        # group context (bigger)
         try:
             history = get_history(chat_id, HISTORY_LIMIT)
         except Exception:
             history = []
         messages += history
 
-        # personal mini-context (this user in this group)
         try:
             u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
         except Exception:
@@ -522,7 +509,6 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             messages.append({"role": "system", "content": "Недавние сообщения этого же пользователя (для персонального подхода):"})
             messages += u_hist
 
-        # generate
         try:
             reply = groq_chat(messages)
             if not reply:
