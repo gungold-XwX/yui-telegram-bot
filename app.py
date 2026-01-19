@@ -85,9 +85,10 @@ def init_db():
     with _db_lock:
         conn = _db()
         cur = conn.cursor()
+        # NOTE: intentionally keep schema compatible with older DBs
+        # messages: chat_id, role, content, ts (no mandatory id column)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
                 role TEXT NOT NULL,        -- 'user' / 'assistant'
                 content TEXT NOT NULL,
@@ -115,10 +116,11 @@ def save_message(chat_id: int, role: str, content: str):
         conn.close()
 
 def get_history(chat_id: int, limit: int):
+    # FIX: order by ts, not id (older DBs have no id column)
     with _db_lock:
         conn = _db()
         rows = conn.execute(
-            "SELECT role, content FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+            "SELECT role, content FROM messages WHERE chat_id=? ORDER BY ts DESC LIMIT ?",
             (chat_id, limit)
         ).fetchall()
         conn.close()
@@ -220,7 +222,6 @@ def _clean_name(raw: str) -> str | None:
     bad = {"привет", "ок", "ладно", "бот", "юи", "ии", "ai", "yui"}
     if name.lower() in bad:
         return None
-    # имя должно быть одним словом или короткой связкой
     if not re.match(r"^[A-Za-zА-Яа-яЁё\- ]{2,24}$", name):
         return None
     return name
@@ -232,22 +233,15 @@ def maybe_learn_name(user_id: int, text: str):
     for pat in NAME_PATTERNS:
         m = re.match(pat, tl, flags=re.IGNORECASE)
         if m:
-            # берём кусок из оригинала по длине группы
             raw = t[-len(m.group(1)):]
             name = _clean_name(raw)
             if name:
                 set_name(user_id, name)
             return
 
-    # если сообщение — одно слово (вероятно имя), но только в личке это норм.
-    if re.match(r"^[A-Za-zА-Яа-яЁё\-]{2,24}$", t):
-        if t.lower() not in {"юи", "бот", "ии", "ai", "yui"}:
-            # не будем авто-сохранять одиночное слово как имя без явной фразы — слишком риск.
-            return
-
+# typing time depends on reply length (min 10 sec)
 def calc_typing_seconds(reply_text: str) -> float:
     n = max(0, len(reply_text))
-    # минимум 10 сек + зависимость от длины (плавно), с верхней границей
     sec = MIN_TYPING_SEC + (n / 220.0) * 6.0
     return max(MIN_TYPING_SEC, min(MAX_TYPING_SEC, sec))
 
@@ -261,7 +255,7 @@ def typing_sleep(chat_id: int, seconds: float):
         time.sleep(min(TYPING_PING_EVERY, end - now))
         send_typing(chat_id)
 
-# Чтобы не отвечать одновременно в один и тот же чат (параллельные апдейты)
+# one-at-a-time per chat
 _chat_locks: dict[int, threading.Lock] = {}
 _chat_locks_guard = threading.Lock()
 
@@ -271,22 +265,23 @@ def chat_lock(chat_id: int) -> threading.Lock:
             _chat_locks[chat_id] = threading.Lock()
         return _chat_locks[chat_id]
 
-# ================== Core worker (runs in background thread) ==================
-def process_message(chat_id: int, user_id: int, text: str, reply_to_message_id: int, chat_type: str):
+# ================== Core worker (background thread) ==================
+def process_message(chat_id: int, user_id: int, text: str, reply_to_message_id: int):
     lock = chat_lock(chat_id)
-    if not lock.acquire(blocking=False):
-        # уже обрабатываем что-то в этом чате — не флудим
+    # wait a bit if another message is processing
+    if not lock.acquire(timeout=2):
         return
     try:
-        # 1) memory: name
         maybe_learn_name(user_id, text)
-
-        # 2) save user message
         save_message(chat_id, "user", text)
 
-        # 3) build messages
         uname = get_name(user_id)
-        history = get_history(chat_id, HISTORY_LIMIT)
+
+        # if DB is weird, don't die: work without history
+        try:
+            history = get_history(chat_id, HISTORY_LIMIT)
+        except Exception:
+            history = []
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages += FEW_SHOTS
@@ -301,25 +296,26 @@ def process_message(chat_id: int, user_id: int, text: str, reply_to_message_id: 
 
         messages += history
 
-        # 4) generate
         try:
             reply = groq_chat(messages)
             if not reply:
-                reply = "хм… можешь переформулировать? (・_・;)"
+                reply = "хм… можешь сказать чуть конкретнее? (・_・;)"
         except Exception:
             reply = "у меня сейчас сбой связи. напиши ещё раз чуть позже, ладно? (・_・;)"
 
-        # 5) typing simulation (min 10s)
-        wait_sec = calc_typing_seconds(reply)
-        typing_sleep(chat_id, wait_sec)
+        # visible typing
+        typing_sleep(chat_id, calc_typing_seconds(reply))
 
-        # 6) save assistant + send
         save_message(chat_id, "assistant", reply)
-        tg("sendMessage", {
-            "chat_id": chat_id,
-            "text": reply[:3500],
-            "reply_to_message_id": reply_to_message_id,
-        })
+        try:
+            tg("sendMessage", {
+                "chat_id": chat_id,
+                "text": reply[:3500],
+                "reply_to_message_id": reply_to_message_id,
+            })
+        except Exception:
+            # if telegram send fails, at least don't crash the thread
+            pass
     finally:
         lock.release()
 
@@ -338,32 +334,26 @@ def webhook():
     if not should_reply(msg):
         return "ok"
 
-    chat = msg.get("chat", {})
-    chat_id = chat.get("id")
-    chat_type = chat.get("type", "private")
-
-    from_user = msg.get("from", {})
-    user_id = from_user.get("id")
+    chat_id = msg["chat"]["id"]
+    user_id = msg.get("from", {}).get("id")
     text = (msg.get("text") or "").strip()
     reply_to_message_id = msg.get("message_id")
 
     if not (chat_id and user_id and text):
         return "ok"
 
-    # запускаем обработку в фоне, чтобы Telegram не ретраил webhook из-за ожидания typing
-    t = threading.Thread(
+    # Background thread so webhook returns fast
+    threading.Thread(
         target=process_message,
-        args=(chat_id, user_id, text, reply_to_message_id, chat_type),
+        args=(chat_id, user_id, text, reply_to_message_id),
         daemon=True
-    )
-    t.start()
+    ).start()
 
     return "ok"
 
 # ================== Startup (Flask 3 safe) ==================
 init_db()
 
-# auto webhook set on startup
 if TG_TOKEN and PUBLIC_URL and WEBHOOK_SECRET:
     try:
         tg("setWebhook", {"url": f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"})
