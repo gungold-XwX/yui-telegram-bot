@@ -376,4 +376,140 @@ def process_message(chat_id: int, user_id: int, text: str, reply_to_message_id: 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
 
         if uname:
-            messages.append({"role": "system", "content": f"Имя пользователя: {uname}. Используй имя редко и к месту."}
+            messages.append({"role": "system", "content": f"Имя пользователя: {uname}. Используй имя редко и к месту."})
+
+        if needs_identity_answer(text):
+            messages.append({"role": "system", "content": "Вопрос про личность. Ответь коротко: тебя зовут Юи, ты ИИ."})
+        else:
+            messages.append({"role": "system", "content": "Не представляйся и не обсуждай, что ты ИИ, если тебя не спрашивали."})
+
+        messages += history
+
+        try:
+            reply = groq_chat(messages)
+            if not reply:
+                reply = "ладно… скажи чуть конкретнее. (・_・;)"
+        except Exception:
+            reply = "связь легла. не радуйся — потом отвечу. (・_・;)"
+
+        time.sleep(human_read_delay())
+        parts = split_reply(reply)
+
+        for idx, part in enumerate(parts):
+            typing_sleep(chat_id, calc_typing_seconds(part))
+            send_message(chat_id, part, reply_to_message_id if idx == 0 else None)
+            save_message(chat_id, "assistant", part)
+            if idx < len(parts) - 1:
+                time.sleep(random.uniform(0.8, 2.2))
+    finally:
+        lock.release()
+
+# ================== Proactive initiative loop ==================
+def proactive_loop():
+    if not PROACTIVE_ENABLED or GROUP_CHAT_ID == 0:
+        log("Proactive disabled")
+        return
+
+    log("Proactive enabled for chat:", GROUP_CHAT_ID)
+
+    while True:
+        try:
+            time.sleep(PROACTIVE_CHECK_SEC)
+
+            chat_id = GROUP_CHAT_ID
+
+            # не лезем, если чат “мертвый”
+            if count_msgs_last_24h(chat_id) < PROACTIVE_MIN_MSGS_24H:
+                continue
+
+            last_user = get_last_ts(chat_id, "user")
+            last_bot = get_last_ts(chat_id, "assistant")
+            now = int(time.time())
+
+            # тишина?
+            if last_user == 0 or now - last_user < PROACTIVE_QUIET_MIN * 60:
+                continue
+
+            # кулдаун после последнего сообщения Юи
+            if last_bot != 0 and now - last_bot < PROACTIVE_COOLDOWN_MIN * 60:
+                continue
+
+            # шанс, чтобы не быть “по расписанию”
+            if random.random() > PROACTIVE_PROB:
+                continue
+
+            context = get_recent_plain_text(chat_id, limit=12)
+            if not context:
+                continue
+
+            # короткая инициатива по теме чата
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": "Ты сейчас в групповом чате. Иногда можешь аккуратно взять инициативу, но НЕ спамь. Напиши 1 короткую реплику (1–2 предложения), которая продолжит или оживит разговор по последнему контексту. Без ассистентских штампов. Можно чуть цундерэ."},
+                {"role": "user", "content": f"Последние реплики людей в чате:\n{context}\n\nНапиши одну инициативную фразу."}
+            ]
+
+            try:
+                text = groq_chat(messages).strip()
+            except Exception:
+                continue
+
+            if not text:
+                continue
+
+            # “прочитала/подумала” и печатает
+            time.sleep(human_read_delay())
+            typing_sleep(chat_id, calc_typing_seconds(text))
+
+            send_message(chat_id, text, None)
+            save_message(chat_id, "assistant", text)
+
+        except Exception as e:
+            log("Proactive loop error:", repr(e))
+
+# ================== Routes ==================
+@app.get("/")
+def home():
+    return "ok"
+
+@app.post(f"/webhook/{WEBHOOK_SECRET}")
+def webhook():
+    upd = request.json or {}
+    msg = upd.get("message") or upd.get("edited_message")
+    if not msg or not msg.get("text"):
+        return "ok"
+
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+    log("webhook hit chat_id=", chat_id, "text=", (msg.get("text") or "")[:120])
+
+    if not should_reply(msg):
+        return "ok"
+
+    user_id = msg.get("from", {}).get("id")
+    text = (msg.get("text") or "").strip()
+    reply_to_message_id = msg.get("message_id")
+
+    if not (chat_id and user_id and text):
+        return "ok"
+
+    threading.Thread(
+        target=process_message,
+        args=(chat_id, user_id, text, reply_to_message_id),
+        daemon=True
+    ).start()
+
+    return "ok"
+
+# ================== Startup ==================
+init_db()
+refresh_bot_id()
+
+if TG_TOKEN and PUBLIC_URL and WEBHOOK_SECRET:
+    try:
+        tg("setWebhook", {"url": f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"})
+    except Exception as e:
+        log("setWebhook failed:", repr(e))
+
+# start proactive loop in background
+threading.Thread(target=proactive_loop, daemon=True).start()
