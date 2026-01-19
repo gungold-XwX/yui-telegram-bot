@@ -17,14 +17,19 @@ MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
 DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
 
 # bigger memory by default
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "40"))
-USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "14"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "50"))          # group history in prompt
+USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "18")) # per-user history in prompt
 
-# Creator settings
-CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "0"))
-CREATOR_NICK = os.getenv("CREATOR_NICK", "папа")
+# ================== FAMILY / OWNERS (hardcoded) ==================
+# папа (ты) — из твоих логов
+CREATOR_USER_ID = 1265435001
+CREATOR_NICK = "папа"
 
-# group proactive mode (optional)
+# мама
+MOTHER_USER_ID = 725485618
+MOTHER_NICK = "мама"
+
+# ================== Group proactive (optional) ==================
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
 PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "0") == "1"
 PROACTIVE_CHECK_SEC = int(os.getenv("PROACTIVE_CHECK_SEC", "60"))
@@ -33,12 +38,13 @@ PROACTIVE_COOLDOWN_MIN = int(os.getenv("PROACTIVE_COOLDOWN_MIN", "25"))
 PROACTIVE_PROB = float(os.getenv("PROACTIVE_PROB", "0.25"))
 PROACTIVE_MIN_MSGS_24H = int(os.getenv("PROACTIVE_MIN_MSGS_24H", "8"))
 
-# human-like behavior
+# ================== Human-like behavior ==================
 MIN_TYPING_SEC = float(os.getenv("MIN_TYPING_SEC", "7"))
 MAX_TYPING_SEC = float(os.getenv("MAX_TYPING_SEC", "25"))
 TYPING_PING_EVERY = 4.0
 READ_DELAY_MAX = float(os.getenv("READ_DELAY_MAX", "6"))
-SPLIT_PROB = float(os.getenv("SPLIT_PROB", "0.35"))
+
+SPLIT_PROB = float(os.getenv("SPLIT_PROB", "0.38"))
 MAX_PARTS = int(os.getenv("MAX_PARTS", "3"))
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -117,16 +123,15 @@ def init_db():
             "chat_id": "INTEGER",
             "role": "TEXT",
             "content": "TEXT",
-            "ts": "INTEGER"
+            "ts": "INTEGER",
         })
 
-        # profiles (create minimal if missing)
+        # profiles minimal then migrate everything
         cur.execute("""
             CREATE TABLE IF NOT EXISTS profiles (
                 user_id INTEGER PRIMARY KEY
             )
         """)
-        # IMPORTANT: migrate EVERYTHING we rely on, including updated_at
         ensure_columns(conn, "profiles", {
             "name": "TEXT",                 # legacy
             "tg_username": "TEXT",
@@ -134,8 +139,8 @@ def init_db():
             "tg_last_name": "TEXT",
             "display_name": "TEXT",
             "notes": "TEXT",
-            "relationship": "TEXT",
-            "updated_at": "INTEGER"
+            "relationship": "TEXT",          # creator / mother / None
+            "updated_at": "INTEGER",
         })
 
         cur.execute("""
@@ -170,7 +175,9 @@ def get_history(chat_id: int, limit: int):
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 def save_user_message_tagged(chat_id: int, user_id: int, text: str):
+    # group history
     save_message(chat_id, "user", text)
+    # tagged copy for per-user memory in this chat
     save_message(chat_id, "user", f"[u:{user_id}] {text}")
 
 def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
@@ -183,27 +190,33 @@ def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
         ).fetchall()
         conn.close()
     rows = list(reversed(rows))
-    cleaned = []
+    out = []
     for r in rows:
         c = r["content"]
         if c.startswith(tag):
             c = c[len(tag):]
-        cleaned.append({"role": "user", "content": c})
-    return cleaned
+        out.append({"role": "user", "content": c})
+    return out
 
 def upsert_profile_from_tg(user: dict):
     user_id = user.get("id")
     if not user_id:
         return
+
     username = user.get("username")
     first_name = user.get("first_name")
     last_name = user.get("last_name")
-    rel = "creator" if (CREATOR_USER_ID and user_id == CREATOR_USER_ID) else None
+
+    rel = None
+    if user_id == CREATOR_USER_ID:
+        rel = "creator"
+    elif user_id == MOTHER_USER_ID:
+        rel = "mother"
+
     ts = int(time.time())
 
     with _db_lock:
         conn = _db()
-        # NOTE: use COALESCE to keep existing relationship if already set
         conn.execute("""
             INSERT INTO profiles (user_id, tg_username, tg_first_name, tg_last_name, relationship, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -211,7 +224,7 @@ def upsert_profile_from_tg(user: dict):
               tg_username=excluded.tg_username,
               tg_first_name=excluded.tg_first_name,
               tg_last_name=excluded.tg_last_name,
-              relationship=COALESCE(profiles.relationship, excluded.relationship),
+              relationship=COALESCE(excluded.relationship, profiles.relationship),
               updated_at=excluded.updated_at
         """, (user_id, username, first_name, last_name, rel, ts))
         conn.commit()
@@ -289,7 +302,7 @@ def groq_chat(messages: list[dict]) -> str:
         "messages": messages,
         "temperature": 0.62,
         "top_p": 0.9,
-        "max_tokens": 520,
+        "max_tokens": 560,
     }
     r = requests.post(GROQ_URL, headers=headers, json=body, timeout=60)
     r.raise_for_status()
@@ -313,7 +326,7 @@ def asks_my_name(text: str) -> bool:
 
 NAME_PATTERNS = [
     r"^\s*меня\s+зовут\s+(.+)\s*$",
-    r"^\s*мо[eё]\s+имя\s+(.+)\s*$",
+    r"^\s*мо[её]\s+имя\s+(.+)\s*$",
     r"^\s*имя\s*[:\-]?\s*(.+)\s*$",
     r"^\s*зови\s+меня\s+(.+)\s*$",
     r"^\s*можешь\s+звать\s+меня\s+(.+)\s*$",
@@ -350,7 +363,8 @@ def calc_typing_seconds(part_text: str) -> float:
     return max(2.5, min(MAX_TYPING_SEC, sec))
 
 def human_read_delay() -> float:
-    if random.random() < 0.35:
+    # иногда "прочитала и подумала", без typing
+    if random.random() < 0.30:
         return 0.0
     return random.uniform(0.8, max(0.8, READ_DELAY_MAX))
 
@@ -371,6 +385,7 @@ def split_reply(reply: str) -> list[str]:
     if random.random() > SPLIT_PROB:
         return [reply]
 
+    # try split by blank lines
     chunks = [c.strip() for c in re.split(r"\n{2,}", reply) if c.strip()]
     parts: list[str] = []
     for c in chunks:
@@ -378,6 +393,7 @@ def split_reply(reply: str) -> list[str]:
         if len(parts) >= MAX_PARTS:
             break
 
+    # fallback: split by sentence boundary
     if len(parts) == 1 and len(reply) > 220 and MAX_PARTS >= 2:
         m = re.search(r"(.{120,260}?[\.\!\?])\s+(.*)", reply, flags=re.S)
         if m:
@@ -460,12 +476,17 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         notes = prof.get("notes") or None
         relationship = prof.get("relationship") or None
 
-        is_creator = (CREATOR_USER_ID and user_id == CREATOR_USER_ID)
+        is_creator = (relationship == "creator")
+        is_mother = (relationship == "mother")
 
+        # quick direct: "как меня зовут?"
         if asks_my_name(text):
             name_guess = display_name or tg_first_name
-            prefix = f"{CREATOR_NICK}, " if is_creator else ""
-            reply = f"{prefix}тебя зовут {name_guess}." if name_guess else f"{prefix}я не уверена. скажи “меня зовут …”, и я запомню."
+            prefix = f"{CREATOR_NICK}, " if is_creator else (f"{MOTHER_NICK}, " if is_mother else "")
+            if name_guess:
+                reply = f"{prefix}тебя зовут {name_guess}."
+            else:
+                reply = f"{prefix}я не уверена. скажи “меня зовут …”, и я запомню."
             time.sleep(human_read_delay())
             typing_sleep(chat_id, calc_typing_seconds(reply))
             send_message(chat_id, reply, reply_to_message_id)
@@ -474,6 +495,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
 
+        # author card
         author_lines = [f"user_id={user_id}"]
         if tg_username:
             author_lines.append(f"username=@{tg_username}")
@@ -483,24 +505,34 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             author_lines.append(f"tg_first_name={tg_first_name}")
         if notes:
             author_lines.append(f"notes={notes}")
-        if relationship == "creator":
-            author_lines.append(f"relationship=creator (иногда обращайся к нему '{CREATOR_NICK}', но не постоянно)")
+
+        if is_creator:
+            author_lines.append(f"relationship=creator (это папа. иногда называй его '{CREATOR_NICK}', но не постоянно)")
+        elif is_mother:
+            author_lines.append(f"relationship=mother (это мама. иногда называй её '{MOTHER_NICK}', но не постоянно)")
+
         messages.append({"role": "system", "content": "Карточка автора текущего сообщения:\n" + "\n".join(author_lines)})
 
+        # identity behavior
         if needs_identity_answer(text):
             messages.append({"role": "system", "content": "Вопрос про твою личность. Ответь коротко: тебя зовут Юи, ты ИИ."})
         else:
             messages.append({"role": "system", "content": "Если тебя не спрашивали, не представляйся и не повторяй, что ты ИИ."})
 
+        # extra tone rules for family
         if is_creator:
-            messages.append({"role": "system", "content": f"Это твой создатель. Иногда называй его '{CREATOR_NICK}'."})
+            messages.append({"role": "system", "content": f"Это твой создатель (папа). Можно чуть дерзко, но по-доброму. Иногда называй его '{CREATOR_NICK}'."})
+        elif is_mother:
+            messages.append({"role": "system", "content": f"Это твоя мама-создательница. С ней мягче. Иногда называй её '{MOTHER_NICK}'."})
 
+        # group context
         try:
             history = get_history(chat_id, HISTORY_LIMIT)
         except Exception:
             history = []
         messages += history
 
+        # per-user context in this chat
         try:
             u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
         except Exception:
@@ -509,13 +541,15 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             messages.append({"role": "system", "content": "Недавние сообщения этого же пользователя (для персонального подхода):"})
             messages += u_hist
 
+        # generate
         try:
             reply = groq_chat(messages)
             if not reply:
-                reply = "что-то ты сказал слишком туманно… уточни одним предложением. (・_・;)"
+                reply = "слишком туманно. уточни одним предложением. (・_・;)"
         except Exception:
-            reply = "связь легла. потом отвечу — не расслабляйся. (・_・;)"
+            reply = "связь легла. потом отвечу. (・_・;)"
 
+        # human timing + split
         time.sleep(human_read_delay())
         parts = split_reply(reply)
 
@@ -577,7 +611,7 @@ def proactive_loop():
                 continue
 
             try:
-                hist = get_history(chat_id, min(14, HISTORY_LIMIT))
+                hist = get_history(chat_id, min(16, HISTORY_LIMIT))
             except Exception:
                 hist = []
             user_lines = [m["content"] for m in hist if m["role"] == "user"][-10:]
