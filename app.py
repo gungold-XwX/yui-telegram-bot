@@ -7,29 +7,39 @@ import random
 import requests
 from flask import Flask, request
 
-# ================== ENV ==================
-TG_TOKEN = os.getenv("TG_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-PUBLIC_URL = os.getenv("PUBLIC_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
+# ============================================================
+# CONFIG
+# ============================================================
 
-MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
+# Telegram
+TG_TOKEN = os.getenv("TG_TOKEN")  # required
+PUBLIC_URL = os.getenv("PUBLIC_URL")  # required for webhook set
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_yuii")  # route token
+
+# Fireworks (OpenAI-compatible)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # required
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "accounts/fireworks/models/llama-v3p1-70b-instruct")
+
+# SQLite (Render disk)
 DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
 
-# bigger memory by default
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "50"))          # group history in prompt
+# Memory sizes (you can tweak via env)
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "50"))          # group/global history in prompt
 USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "18")) # per-user history in prompt
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "520"))       # output cap per reply
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.62"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.9"))
 
-# ================== FAMILY / OWNERS (hardcoded) ==================
-# папа (ты) — из твоих логов
-CREATOR_USER_ID = 1265435001
-CREATOR_NICK = "папа"
+# Human-like behavior
+MIN_TYPING_SEC = float(os.getenv("MIN_TYPING_SEC", "7"))
+MAX_TYPING_SEC = float(os.getenv("MAX_TYPING_SEC", "25"))
+READ_DELAY_MAX = float(os.getenv("READ_DELAY_MAX", "6"))
+TYPING_PING_EVERY = 4.0
+SPLIT_PROB = float(os.getenv("SPLIT_PROB", "0.38"))
+MAX_PARTS = int(os.getenv("MAX_PARTS", "3"))
 
-# мама
-MOTHER_USER_ID = 725485618
-MOTHER_NICK = "мама"
-
-# ================== Group proactive (optional) ==================
+# Proactive (optional)
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
 PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "0") == "1"
 PROACTIVE_CHECK_SEC = int(os.getenv("PROACTIVE_CHECK_SEC", "60"))
@@ -38,23 +48,27 @@ PROACTIVE_COOLDOWN_MIN = int(os.getenv("PROACTIVE_COOLDOWN_MIN", "25"))
 PROACTIVE_PROB = float(os.getenv("PROACTIVE_PROB", "0.25"))
 PROACTIVE_MIN_MSGS_24H = int(os.getenv("PROACTIVE_MIN_MSGS_24H", "8"))
 
-# ================== Human-like behavior ==================
-MIN_TYPING_SEC = float(os.getenv("MIN_TYPING_SEC", "7"))
-MAX_TYPING_SEC = float(os.getenv("MAX_TYPING_SEC", "25"))
-TYPING_PING_EVERY = 4.0
-READ_DELAY_MAX = float(os.getenv("READ_DELAY_MAX", "6"))
+# Family (hardcoded)
+CREATOR_USER_ID = 1265435001  # <-- поменяй если ты не он
+CREATOR_NICK = "папа"
 
-SPLIT_PROB = float(os.getenv("SPLIT_PROB", "0.38"))
-MAX_PARTS = int(os.getenv("MAX_PARTS", "3"))
+MOTHER_USER_ID = 725485618
+MOTHER_NICK = "мама"
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# ============================================================
+# APP
+# ============================================================
 
 app = Flask(__name__)
+_db_lock = threading.Lock()
 
 def log(*a):
     print("[YUI]", *a, flush=True)
 
-# ================== PERSONA ==================
+# ============================================================
+# PERSONA
+# ============================================================
+
 SYSTEM_PROMPT = """
 Ты — Юи.
 
@@ -91,8 +105,9 @@ FEW_SHOTS = [
     {"role": "assistant", "content": "ок, принято. дальше что? (￣▿￣)"},
 ]
 
-# ================== DB ==================
-_db_lock = threading.Lock()
+# ============================================================
+# DB helpers + migrations
+# ============================================================
 
 def _db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -110,7 +125,6 @@ def init_db():
         conn = _db()
         cur = conn.cursor()
 
-        # messages
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 chat_id INTEGER NOT NULL,
@@ -126,20 +140,18 @@ def init_db():
             "ts": "INTEGER",
         })
 
-        # profiles minimal then migrate everything
         cur.execute("""
             CREATE TABLE IF NOT EXISTS profiles (
                 user_id INTEGER PRIMARY KEY
             )
         """)
         ensure_columns(conn, "profiles", {
-            "name": "TEXT",                 # legacy
             "tg_username": "TEXT",
             "tg_first_name": "TEXT",
             "tg_last_name": "TEXT",
             "display_name": "TEXT",
             "notes": "TEXT",
-            "relationship": "TEXT",          # creator / mother / None
+            "relationship": "TEXT",    # creator / mother / None
             "updated_at": "INTEGER",
         })
 
@@ -150,6 +162,25 @@ def init_db():
             )
         """)
 
+        conn.commit()
+        conn.close()
+
+def seed_family_profiles():
+    ts = int(time.time())
+    with _db_lock:
+        conn = _db()
+        # папа
+        conn.execute("""
+            INSERT INTO profiles (user_id, relationship, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET relationship=excluded.relationship, updated_at=excluded.updated_at
+        """, (CREATOR_USER_ID, "creator", ts))
+        # мама
+        conn.execute("""
+            INSERT INTO profiles (user_id, relationship, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET relationship=excluded.relationship, updated_at=excluded.updated_at
+        """, (MOTHER_USER_ID, "mother", ts))
         conn.commit()
         conn.close()
 
@@ -175,9 +206,7 @@ def get_history(chat_id: int, limit: int):
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 def save_user_message_tagged(chat_id: int, user_id: int, text: str):
-    # group history
     save_message(chat_id, "user", text)
-    # tagged copy for per-user memory in this chat
     save_message(chat_id, "user", f"[u:{user_id}] {text}")
 
 def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
@@ -276,7 +305,10 @@ def get_profile(user_id: int):
         conn.close()
     return dict(row) if row else None
 
-# ================== Telegram / Groq ==================
+# ============================================================
+# Telegram API
+# ============================================================
+
 def tg(method: str, payload: dict):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
     r = requests.post(url, json=payload, timeout=20)
@@ -295,21 +327,48 @@ def send_message(chat_id: int, text: str, reply_to: int | None = None):
         payload["reply_to_message_id"] = reply_to
     tg("sendMessage", payload)
 
-def groq_chat(messages: list[dict]) -> str:
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    body = {
-        "model": MODEL,
+# ============================================================
+# Fireworks (OpenAI-compatible) chat completion
+# ============================================================
+
+def llm_chat(messages: list[dict]) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    url = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": OPENAI_MODEL,
         "messages": messages,
-        "temperature": 0.62,
-        "top_p": 0.9,
-        "max_tokens": 560,
+        "temperature": LLM_TEMPERATURE,
+        "top_p": LLM_TOP_P,
+        "max_tokens": LLM_MAX_TOKENS,
     }
-    r = requests.post(GROQ_URL, headers=headers, json=body, timeout=60)
-    r.raise_for_status()
+
+    r = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=90,
+    )
+
+    if not r.ok:
+        # log full error body to Render logs
+        try:
+            log("LLM error:", r.status_code, r.text[:800])
+        except Exception:
+            pass
+        r.raise_for_status()
+
     data = r.json()
     return (data["choices"][0]["message"]["content"] or "").strip()
 
-# ================== Helpers ==================
+# ============================================================
+# Behavior helpers
+# ============================================================
+
 IDENTITY_KEYS = [
     "кто ты", "ты кто",
     "как тебя зовут", "тебя зовут", "как звать",
@@ -363,7 +422,6 @@ def calc_typing_seconds(part_text: str) -> float:
     return max(2.5, min(MAX_TYPING_SEC, sec))
 
 def human_read_delay() -> float:
-    # иногда "прочитала и подумала", без typing
     if random.random() < 0.30:
         return 0.0
     return random.uniform(0.8, max(0.8, READ_DELAY_MAX))
@@ -385,7 +443,6 @@ def split_reply(reply: str) -> list[str]:
     if random.random() > SPLIT_PROB:
         return [reply]
 
-    # try split by blank lines
     chunks = [c.strip() for c in re.split(r"\n{2,}", reply) if c.strip()]
     parts: list[str] = []
     for c in chunks:
@@ -393,7 +450,6 @@ def split_reply(reply: str) -> list[str]:
         if len(parts) >= MAX_PARTS:
             break
 
-    # fallback: split by sentence boundary
     if len(parts) == 1 and len(reply) > 220 and MAX_PARTS >= 2:
         m = re.search(r"(.{120,260}?[\.\!\?])\s+(.*)", reply, flags=re.S)
         if m:
@@ -402,7 +458,10 @@ def split_reply(reply: str) -> list[str]:
     parts = [p for p in parts if p]
     return parts[:MAX_PARTS] if parts else [reply]
 
-# ================== Reply rules for group ==================
+# ============================================================
+# Group reply rules
+# ============================================================
+
 BOT_ID = None
 
 def refresh_bot_id():
@@ -440,7 +499,10 @@ def should_reply(msg: dict) -> bool:
     trigger = t.startswith(("юи", "yui", "ии", "ai", "бот"))
     return mentioned or trigger
 
-# ================== per-chat lock ==================
+# ============================================================
+# Per-chat lock (avoid race)
+# ============================================================
+
 _chat_locks: dict[int, threading.Lock] = {}
 _chat_locks_guard = threading.Lock()
 
@@ -450,7 +512,10 @@ def chat_lock(chat_id: int) -> threading.Lock:
             _chat_locks[chat_id] = threading.Lock()
         return _chat_locks[chat_id]
 
-# ================== Worker ==================
+# ============================================================
+# Main worker
+# ============================================================
+
 def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_id: int):
     user_id = from_user.get("id")
     if not user_id:
@@ -479,7 +544,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         is_creator = (relationship == "creator")
         is_mother = (relationship == "mother")
 
-        # quick direct: "как меня зовут?"
+        # "как меня зовут?"
         if asks_my_name(text):
             name_guess = display_name or tg_first_name
             prefix = f"{CREATOR_NICK}, " if is_creator else (f"{MOTHER_NICK}, " if is_mother else "")
@@ -495,7 +560,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
 
-        # author card
+        # Author card
         author_lines = [f"user_id={user_id}"]
         if tg_username:
             author_lines.append(f"username=@{tg_username}")
@@ -513,26 +578,26 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
 
         messages.append({"role": "system", "content": "Карточка автора текущего сообщения:\n" + "\n".join(author_lines)})
 
-        # identity behavior
+        # Identity behavior
         if needs_identity_answer(text):
             messages.append({"role": "system", "content": "Вопрос про твою личность. Ответь коротко: тебя зовут Юи, ты ИИ."})
         else:
             messages.append({"role": "system", "content": "Если тебя не спрашивали, не представляйся и не повторяй, что ты ИИ."})
 
-        # extra tone rules for family
+        # Family tone
         if is_creator:
-            messages.append({"role": "system", "content": f"Это твой создатель (папа). Можно чуть дерзко, но по-доброму. Иногда называй его '{CREATOR_NICK}'."})
+            messages.append({"role": "system", "content": f"Это твой создатель (папа). Можно чуть дерзко, но по-доброму. Иногда называй его '{CREATOR_NICK}', но не в каждом сообщении."})
         elif is_mother:
-            messages.append({"role": "system", "content": f"Это твоя мама-создательница. С ней мягче. Иногда называй её '{MOTHER_NICK}'."})
+            messages.append({"role": "system", "content": f"Это твоя мама-создательница. С ней мягче. Иногда называй её '{MOTHER_NICK}', но не в каждом сообщении."})
 
-        # group context
+        # Global chat memory
         try:
             history = get_history(chat_id, HISTORY_LIMIT)
         except Exception:
             history = []
         messages += history
 
-        # per-user context in this chat
+        # Per-user memory
         try:
             u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
         except Exception:
@@ -541,15 +606,15 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             messages.append({"role": "system", "content": "Недавние сообщения этого же пользователя (для персонального подхода):"})
             messages += u_hist
 
-        # generate
+        # Generate
         try:
-            reply = groq_chat(messages)
+            reply = llm_chat(messages)
             if not reply:
                 reply = "слишком туманно. уточни одним предложением. (・_・;)"
-        except Exception:
+        except Exception as e:
+            log("LLM exception:", repr(e))
             reply = "связь легла. потом отвечу. (・_・;)"
 
-        # human timing + split
         time.sleep(human_read_delay())
         parts = split_reply(reply)
 
@@ -563,7 +628,10 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
     finally:
         lock.release()
 
-# ================== Proactive loop ==================
+# ============================================================
+# Proactive loop
+# ============================================================
+
 def count_msgs_last_24h(chat_id: int) -> int:
     since = int(time.time()) - 24 * 3600
     with _db_lock:
@@ -589,6 +657,7 @@ def proactive_loop():
     if not PROACTIVE_ENABLED or GROUP_CHAT_ID == 0:
         log("Proactive disabled")
         return
+
     log("Proactive enabled for chat:", GROUP_CHAT_ID)
 
     while True:
@@ -624,7 +693,7 @@ def proactive_loop():
                 {"role": "system", "content": "Ты в групповом чате. Иногда можешь взять инициативу, но НЕ спамь. 1 короткая реплика (1–2 предложения), по теме последнего контекста. Чуть цундерэ — можно."},
                 {"role": "user", "content": f"Контекст:\n{context}\n\nСкажи одну инициативную фразу."}
             ]
-            text = groq_chat(messages).strip()
+            text = llm_chat(messages).strip()
             if not text:
                 continue
 
@@ -636,7 +705,10 @@ def proactive_loop():
         except Exception as e:
             log("Proactive loop error:", repr(e))
 
-# ================== Routes ==================
+# ============================================================
+# Routes
+# ============================================================
+
 @app.get("/")
 def home():
     return "ok"
@@ -672,14 +744,23 @@ def webhook():
 
     return "ok"
 
-# ================== Startup ==================
-init_db()
-refresh_bot_id()
+# ============================================================
+# Startup
+# ============================================================
 
-if TG_TOKEN and PUBLIC_URL and WEBHOOK_SECRET:
+def set_webhook():
+    if not (TG_TOKEN and PUBLIC_URL and WEBHOOK_SECRET):
+        log("Webhook not set: missing TG_TOKEN/PUBLIC_URL/WEBHOOK_SECRET")
+        return
     try:
         tg("setWebhook", {"url": f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"})
+        log("Webhook set to", f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}")
     except Exception as e:
         log("setWebhook failed:", repr(e))
+
+init_db()
+seed_family_profiles()
+refresh_bot_id()
+set_webhook()
 
 threading.Thread(target=proactive_loop, daemon=True).start()
