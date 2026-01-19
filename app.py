@@ -1,4 +1,3 @@
-# app.py
 import os
 import time
 import re
@@ -16,11 +15,14 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
 
 MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
 DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "18"))
+
+# bigger memory by default
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "40"))          # group history in prompt
+USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "14")) # per-user history in prompt
 
 # Creator settings
-CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "0"))  # <-- set this in Render env
-CREATOR_NICK = os.getenv("CREATOR_NICK", "папа")          # how Yui addresses creator
+CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "0"))
+CREATOR_NICK = os.getenv("CREATOR_NICK", "папа")
 
 # group proactive mode
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
@@ -91,10 +93,18 @@ def _db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def ensure_columns(conn, table: str, cols: dict[str, str]):
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, ddl in cols.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
 def init_db():
     with _db_lock:
         conn = _db()
         cur = conn.cursor()
+
+        # messages (compatible with old schema)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 chat_id INTEGER NOT NULL,
@@ -103,26 +113,34 @@ def init_db():
                 ts INTEGER NOT NULL
             )
         """)
-        # profiles: персональная память по user_id
+        # if ts missing in older versions, add it
+        ensure_columns(conn, "messages", {"ts": "INTEGER"})
+
+        # profiles (older versions might have: user_id, name, updated_at)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS profiles (
                 user_id INTEGER PRIMARY KEY,
-                tg_username TEXT,
-                tg_first_name TEXT,
-                tg_last_name TEXT,
-                display_name TEXT,      -- как человек просит его звать (например "Серафим")
-                notes TEXT,             -- короткие заметки: "любит кратко", "шутит", т.п.
-                relationship TEXT,      -- например: "creator"
+                name TEXT,
                 updated_at INTEGER NOT NULL
             )
         """)
-        # meta: для мелких служебных значений (например, last proactive ts)
+        # migrate/add new columns safely
+        ensure_columns(conn, "profiles", {
+            "tg_username": "TEXT",
+            "tg_first_name": "TEXT",
+            "tg_last_name": "TEXT",
+            "display_name": "TEXT",
+            "notes": "TEXT",
+            "relationship": "TEXT"
+        })
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 k TEXT PRIMARY KEY,
                 v TEXT
             )
         """)
+
         conn.commit()
         conn.close()
 
@@ -147,20 +165,46 @@ def get_history(chat_id: int, limit: int):
     rows = list(reversed(rows))
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
+def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
+    """
+    Лёгкий хак: мы сохраняем user-сообщения в messages без user_id (исторически),
+    поэтому перс.историю берём через отдельный "псевдо-канал" в content:
+    мы будем сохранять user сообщения с префиксом [u:<id>] (см. below).
+    """
+    tag = f"[u:{user_id}] "
+    with _db_lock:
+        conn = _db()
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE chat_id=? AND role='user' AND content LIKE ? ORDER BY ts DESC LIMIT ?",
+            (chat_id, tag + "%", limit)
+        ).fetchall()
+        conn.close()
+    rows = list(reversed(rows))
+    cleaned = []
+    for r in rows:
+        c = r["content"]
+        if c.startswith(tag):
+            c = c[len(tag):]
+        cleaned.append({"role": "user", "content": c})
+    return cleaned
+
+def save_user_message_tagged(chat_id: int, user_id: int, text: str):
+    # сохраняем обычную историю (без тега) для “общего чата”
+    save_message(chat_id, "user", text)
+    # и сохраняем вторую запись с тегом для персональной выборки
+    save_message(chat_id, "user", f"[u:{user_id}] {text}")
+
 def upsert_profile_from_tg(user: dict):
-    """Сохраняем username/first/last по стабильному user_id."""
     user_id = user.get("id")
     if not user_id:
         return
     username = user.get("username")
     first_name = user.get("first_name")
     last_name = user.get("last_name")
+    rel = "creator" if (CREATOR_USER_ID and user_id == CREATOR_USER_ID) else None
 
     with _db_lock:
         conn = _db()
-        # relationship: если создатель
-        rel = "creator" if (CREATOR_USER_ID and user_id == CREATOR_USER_ID) else None
-
         conn.execute("""
             INSERT INTO profiles (user_id, tg_username, tg_first_name, tg_last_name, relationship, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -198,7 +242,6 @@ def add_note(user_id: int, note: str):
         old = (row["notes"] if row else "") or ""
         merged = old.strip()
         if merged:
-            # не дублируем одинаковое
             if note.lower() in merged.lower():
                 conn.close()
                 return
@@ -220,23 +263,6 @@ def get_profile(user_id: int):
         row = conn.execute("SELECT * FROM profiles WHERE user_id=?", (user_id,)).fetchone()
         conn.close()
     return dict(row) if row else None
-
-def meta_get(k: str) -> str | None:
-    with _db_lock:
-        conn = _db()
-        row = conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
-        conn.close()
-    return row["v"] if row else None
-
-def meta_set(k: str, v: str):
-    with _db_lock:
-        conn = _db()
-        conn.execute("""
-            INSERT INTO meta (k, v) VALUES (?, ?)
-            ON CONFLICT(k) DO UPDATE SET v=excluded.v
-        """, (k, v))
-        conn.commit()
-        conn.close()
 
 # ================== Telegram / Groq ==================
 def tg(method: str, payload: dict):
@@ -264,14 +290,14 @@ def groq_chat(messages: list[dict]) -> str:
         "messages": messages,
         "temperature": 0.62,
         "top_p": 0.9,
-        "max_tokens": 420,
+        "max_tokens": 520,  # чуть больше, чтобы хватало “ума”
     }
     r = requests.post(GROQ_URL, headers=headers, json=body, timeout=60)
     r.raise_for_status()
     data = r.json()
     return (data["choices"][0]["message"]["content"] or "").strip()
 
-# ================== Conversation logic ==================
+# ================== Logic helpers ==================
 IDENTITY_KEYS = [
     "кто ты", "ты кто",
     "как тебя зовут", "тебя зовут", "как звать",
@@ -281,13 +307,11 @@ def needs_identity_answer(text: str) -> bool:
     tl = text.lower()
     return any(k in tl for k in IDENTITY_KEYS)
 
-# “как меня зовут?” — ответ из display_name или из tg_first_name
 ASK_MY_NAME_KEYS = ["как меня зовут", "моё имя", "мое имя", "ты помнишь мое имя"]
 def asks_my_name(text: str) -> bool:
     tl = text.lower()
     return any(k in tl for k in ASK_MY_NAME_KEYS)
 
-# ловим имя: “меня зовут … / имя: … / зови меня …”
 NAME_PATTERNS = [
     r"^\s*меня\s+зовут\s+(.+)\s*$",
     r"^\s*мо[её]\s+имя\s+(.+)\s*$",
@@ -422,18 +446,15 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         return
 
     try:
-        # sync TG identity fields
         upsert_profile_from_tg(from_user)
 
-        # learn display name if user told it
         learned = maybe_learn_display_name(user_id, text)
         if learned:
             add_note(user_id, "Сообщил, как его звать.")
 
-        # save history
-        save_message(chat_id, "user", text)
+        # save tagged + group history
+        save_user_message_tagged(chat_id, user_id, text)
 
-        # fetch profile for prompt
         prof = get_profile(user_id) or {}
         display_name = prof.get("display_name") or None
         tg_username = prof.get("tg_username") or None
@@ -441,26 +462,30 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         notes = prof.get("notes") or None
         relationship = prof.get("relationship") or None
 
-        # special addressing for creator
         is_creator = (CREATOR_USER_ID and user_id == CREATOR_USER_ID)
 
-        # handle “как меня зовут?”
+        # quick direct answer: "как меня зовут?"
         if asks_my_name(text):
-            name_guess = display_name or tg_first_name or "не уверена"
-            prefix = f"{CREATOR_NICK}, " if is_creator else ""
-            reply = f"{prefix}тебя зовут {name_guess}." if name_guess != "не уверена" else f"{prefix}я не уверена, как тебя зовут. скажи “меня зовут …”."
+            name_guess = display_name or tg_first_name
+            if is_creator:
+                prefix = f"{CREATOR_NICK}, "
+            else:
+                prefix = ""
+            if name_guess:
+                reply = f"{prefix}тебя зовут {name_guess}."
+            else:
+                reply = f"{prefix}я не уверена. скажи “меня зовут …”, и я запомню."
             time.sleep(human_read_delay())
             typing_sleep(chat_id, calc_typing_seconds(reply))
             send_message(chat_id, reply, reply_to_message_id)
             save_message(chat_id, "assistant", reply)
             return
 
-        # build LLM messages
+        # prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
 
-        # author card (who is speaking right now)
-        author_lines = []
-        author_lines.append(f"user_id={user_id}")
+        # author card
+        author_lines = [f"user_id={user_id}"]
         if tg_username:
             author_lines.append(f"username=@{tg_username}")
         if display_name:
@@ -470,26 +495,32 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         if notes:
             author_lines.append(f"notes={notes}")
         if relationship == "creator":
-            author_lines.append("relationship=creator (обращайся к нему как к папе, но не слишком часто)")
-
+            author_lines.append(f"relationship=creator (иногда обращайся к нему '{CREATOR_NICK}', но не постоянно)")
         messages.append({"role": "system", "content": "Карточка автора текущего сообщения:\n" + "\n".join(author_lines)})
 
-        # identity rule
         if needs_identity_answer(text):
             messages.append({"role": "system", "content": "Вопрос про твою личность. Ответь коротко: тебя зовут Юи, ты ИИ."})
         else:
             messages.append({"role": "system", "content": "Если тебя не спрашивали, не представляйся и не повторяй, что ты ИИ."})
 
-        # creator addressing rule (soft)
         if is_creator:
-            messages.append({"role": "system", "content": f"Это твой создатель. Иногда обращайся к нему '{CREATOR_NICK}', но не в каждом сообщении."})
+            messages.append({"role": "system", "content": f"Это твой создатель. Время от времени называй его '{CREATOR_NICK}'."})
 
-        # chat history (group context)
+        # group context (bigger)
         try:
             history = get_history(chat_id, HISTORY_LIMIT)
         except Exception:
             history = []
         messages += history
+
+        # personal mini-context (this user in this group)
+        try:
+            u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
+        except Exception:
+            u_hist = []
+        if u_hist:
+            messages.append({"role": "system", "content": "Недавние сообщения этого же пользователя (для персонального подхода):"})
+            messages += u_hist
 
         # generate
         try:
@@ -499,7 +530,6 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         except Exception:
             reply = "связь легла. потом отвечу — не расслабляйся. (・_・;)"
 
-        # human-like timing + split
         time.sleep(human_read_delay())
         parts = split_reply(reply)
 
@@ -560,9 +590,8 @@ def proactive_loop():
             if random.random() > PROACTIVE_PROB:
                 continue
 
-            # short context from last messages
             try:
-                hist = get_history(chat_id, min(12, HISTORY_LIMIT))
+                hist = get_history(chat_id, min(14, HISTORY_LIMIT))
             except Exception:
                 hist = []
             user_lines = [m["content"] for m in hist if m["role"] == "user"][-10:]
@@ -573,7 +602,7 @@ def proactive_loop():
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "system", "content": "Ты в групповом чате. Иногда можешь взять инициативу, но НЕ спамь. 1 короткая реплика (1–2 предложения), по теме последнего контекста. Чуть цундерэ — можно."},
-                {"role": "user", "content": f"Контекст последних сообщений:\n{context}\n\nСкажи одну инициативную фразу."}
+                {"role": "user", "content": f"Контекст:\n{context}\n\nСкажи одну инициативную фразу."}
             ]
             text = groq_chat(messages).strip()
             if not text:
