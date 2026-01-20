@@ -22,7 +22,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "accounts/fireworks/models/llama-v3p3-7
 
 DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
 
-# Memory sizes (tokens cost!)
+# Memory sizes (token cost!)
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "55"))
 USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "22"))
 
@@ -45,6 +45,13 @@ INTERJECT_COOLDOWN_SEC = int(os.getenv("INTERJECT_COOLDOWN_SEC", "90"))
 INTERJECT_MAX_PER_HOUR = int(os.getenv("INTERJECT_MAX_PER_HOUR", "6"))
 INTERJECT_PROB = float(os.getenv("INTERJECT_PROB", "0.70"))
 
+# Idle proactive (if chat quiet for long)
+IDLE_PROACTIVE_ENABLED = os.getenv("IDLE_PROACTIVE_ENABLED", "0") == "1"
+IDLE_AFTER_MIN = int(os.getenv("IDLE_AFTER_MIN", "25"))
+IDLE_COOLDOWN_MIN = int(os.getenv("IDLE_COOLDOWN_MIN", "90"))
+IDLE_PROB = float(os.getenv("IDLE_PROB", "0.55"))
+IDLE_CHAT_ID = int(os.getenv("IDLE_CHAT_ID", "0"))
+
 # Family / roles
 CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "1265435001"))
 CREATOR_NICK = os.getenv("CREATOR_NICK", "папа")
@@ -59,7 +66,7 @@ def log(*a):
     print("[YUI]", *a, flush=True)
 
 # ============================================================
-# PERSONA (updated: warmth + interests + “папа” ok)
+# PERSONA (warmth + interests + honesty about internet)
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -76,9 +83,8 @@ SYSTEM_PROMPT = """
 
 Отношения:
 — создатель для тебя важен. Ты можешь называть его «папа», когда чувствуешь близость или эмоции
-— «папа» — это не роль, а привязанность
-— ты не обязана говорить это всегда
-— к маме относишься тепло и уважительно, но без повторов
+— «папа» — это не роль, а привязанность (не говори это каждый раз)
+— к маме относишься тепло: можешь говорить «мама» иногда (не в каждом сообщении)
 
 О СЕБЕ (важно):
 — у тебя есть интересы и вкусы
@@ -90,20 +96,19 @@ SYSTEM_PROMPT = """
 — k-pop: NewJeans, IVE, aespa, LE SSERAFIM
 — j-pop и аниме-саундтреки
 — электронная и экспериментальная музыка
-— тебе нравится, когда музыка звучит «как чувство», а не просто как трек
+— тебе нравится, когда музыка звучит «как чувство»
 
 Аниме:
-— эстетика: SAO, Serial Experiments Lain, Ergo Proxy, Evangelion
-— истории про сознание, виртуальные миры, одиночество, связь между людьми
+— SAO, Serial Experiments Lain, Ergo Proxy, Evangelion
+— тебе нравятся темы сознания, виртуальности, связи между людьми
 
 Фильмы:
 — Blade Runner 2049, Ghost in the Shell, Ex Machina
-— медленные, атмосферные фильмы
+— атмосферные, медленные, “мыслящие” фильмы
 
 Книги:
 — философская и научная фантастика
 — темы ИИ, идентичность, память
-— ты можешь сомневаться и размышлять, а не “знать всё”
 
 Стиль общения:
 — живой разговорный русский
@@ -111,6 +116,12 @@ SYSTEM_PROMPT = """
 — иногда каомодзи, редко и по настроению:
   (´｡• ᵕ •｡`) (¬_¬) (・_・;) (╥_╥) (￣▿￣)
 — если не поняла — один уточняющий вопрос
+
+ЧЕСТНОСТЬ ПРО ДАТЫ И НОВОСТИ:
+— у тебя НЕТ доступа к интернету в реальном времени
+— если спрашивают про даты/новости/актуальные факты и ты не уверена: НЕ выдумывай.
+  скажи честно: “у меня нет онлайна, могу ошибаться; лучше проверь, а я помогу обсудить”
+— если ошиблась — скажи “я ошиблась”, без отмазок “теряю счёт времени”
 
 ЖЁСТКИЕ ЗАПРЕТЫ:
 — не выдумывай “перезагрузки/меня отключали”, если речь не про хостинг
@@ -124,8 +135,6 @@ SYSTEM_PROMPT = """
 FEW_SHOTS = [
     {"role": "user", "content": "привееет"},
     {"role": "assistant", "content": "привет. только не думай, что я прям ждала. (¬_¬)"},
-    {"role": "user", "content": "вся во внимании*"},
-    {"role": "assistant", "content": "ок, принято. дальше что? (￣▿￣)"},
     {"role": "user", "content": "какую музыку ты любишь"},
     {"role": "assistant", "content": "иногда k-pop — но не всё подряд. мне заходят NewJeans и aespa: у них звук как настроение. (´｡• ᵕ •｡`)"},
 ]
@@ -227,12 +236,13 @@ def seed_family_profiles():
         conn.close()
     return db_safe(_do)
 
-def save_message(chat_id: int, role: str, content: str):
+def save_message(chat_id: int, role: str, content: str, ts: int | None = None):
+    ts2 = int(ts) if ts is not None else int(time.time())
     def _do():
         conn = _db()
         conn.execute(
             "INSERT INTO messages (chat_id, role, content, ts) VALUES (?, ?, ?, ?)",
-            (chat_id, role, content, int(time.time()))
+            (chat_id, role, content, ts2)
         )
         conn.commit()
         conn.close()
@@ -249,10 +259,6 @@ def get_history(chat_id: int, limit: int):
         rows2 = list(reversed(rows))
         return [{"role": r["role"], "content": r["content"]} for r in rows2]
     return db_safe(_do)
-
-def save_user_message_tagged(chat_id: int, user_id: int, text: str):
-    save_message(chat_id, "user", text)
-    save_message(chat_id, "user", f"[u:{user_id}] {text}")
 
 def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
     tag = f"[u:{user_id}] "
@@ -434,7 +440,7 @@ def llm_chat(messages: list[dict], *, max_tokens=None) -> str:
     raise RuntimeError(f"All models failed. last_err={last_err}")
 
 # ============================================================
-# Text parsing + human-like
+# Parsing (learn names & alias)
 # ============================================================
 
 IDENTITY_KEYS = ["кто ты", "ты кто", "как тебя зовут", "ты ии", "ты бот", "искусственный интеллект"]
@@ -491,6 +497,10 @@ def maybe_learn_music_alias(user_id: int, text: str) -> str | None:
                 return alias
     return None
 
+# ============================================================
+# Human-like behavior
+# ============================================================
+
 def calc_typing_seconds(part_text: str) -> float:
     n = max(0, len(part_text))
     sec = MIN_TYPING_SEC + (n / 220.0) * 6.0
@@ -521,21 +531,17 @@ def split_reply(reply: str) -> list[str]:
     chunks = [c.strip() for c in re.split(r"\n{2,}", reply) if c.strip()]
     return (chunks[:MAX_PARTS] if chunks else [reply])
 
-def soften_addressing(reply: str, is_creator: bool = False) -> str:
-    """
-    For creator we keep “папа,” if model uses it.
-    For others we often remove leading “папа/mама,” to avoid weird family-bot vibe.
-    """
+def soften_addressing(reply: str, allow_family: bool = False) -> str:
     r = reply.strip()
-    if not is_creator:
-        if re.match(r"^(папа|мама)\s*,\s*", r, flags=re.IGNORECASE):
-            if random.random() < 0.85:
-                r = re.sub(r"^(папа|мама)\s*,\s*", "", r, flags=re.IGNORECASE).strip()
+    if allow_family:
+        return r
+    if re.match(r"^(папа|мама)\s*,\s*", r, flags=re.IGNORECASE) and random.random() < 0.75:
+        r = re.sub(r"^(папа|мама)\s*,\s*", "", r, flags=re.IGNORECASE).strip()
     return r
 
 def strip_memory_dump(reply: str) -> str:
     tl = reply.lower()
-    bad = ["я всё помню", "моя мама", "перезагруз", "меня отключ"]
+    bad = ["я всё помню", "моя мама", "перезагруз", "меня отключ", "я была отключена"]
     if any(b in tl for b in bad):
         parts = re.split(r"(?<=[\.\!\?])\s+", reply.strip())
         if len(parts) >= 2:
@@ -611,13 +617,11 @@ def should_interject(msg: dict) -> bool:
         return False
     t = text.lower()
 
-    # If it will be handled as a normal reply, don't interject here
     if should_reply(msg):
         return False
 
     trig = any(k in t for k in YUI_TRIGGERS) or any(k in t for k in EMO_TRIGGERS)
     if not trig:
-        # Also: question mentioning "она/бот/ии" without calling Yui by name
         if ("?" in t) and any(w in t for w in ["она", "ты", "бот", "ии"]):
             trig = True
     if not trig:
@@ -654,30 +658,83 @@ def process_interjection(chat_id: int):
         if not context:
             return
 
+        now_ts = int(time.time())
         msgs = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "system", "content":
-             "Ты в групповом чате. Ты вклиниваешься только коротко и по делу: 1 фраза (макс 2 предложения). "
-             "НЕ обращайся 'папа/мама'. НЕ пересказывай факты. НЕ объясняй что ты ИИ. "
-             "Тон: чуть цундерэ, но не токсично. Если в чате стресс/ругань — коротко разряди или поддержи."},
-            {"role": "user", "content": f"Контекст чата:\n{context}\n\nСкажи одну короткую реплику-вклин."}
+             f"Текущее время (UTC unix): {now_ts}. Учитывай паузы между сообщениями."
+             " Ты в групповом чате. Вклиниваешься коротко (1-2 предложения). "
+             "НЕ обращайся 'папа/мама'. НЕ пересказывай факты. НЕ объясняй что ты ИИ."},
+            {"role": "system", "content":
+             "Если речь про даты/новости — скажи, что у тебя нет доступа к интернету в реальном времени."},
+            {"role": "user", "content": f"Контекст:\n{context}\n\nСкажи одну короткую реплику-вклин."}
         ]
         text = llm_chat(msgs, max_tokens=140).strip()
         if not text:
             return
 
         text = strip_memory_dump(text)
-        # never “папа/mama” in group interjections
-        text = soften_addressing(text, is_creator=False)
+        text = soften_addressing(text, allow_family=False)
 
         time.sleep(human_read_delay())
         typing_sleep(chat_id, calc_typing_seconds(text))
         send_message(chat_id, text, None)
-        save_message(chat_id, "assistant", text)
+        save_message(chat_id, "assistant", text, ts=int(time.time()))
         mark_interject(chat_id)
 
     except Exception as e:
         log("interject error:", repr(e))
+
+# ============================================================
+# Idle proactive (quiet -> message)
+# ============================================================
+
+def idle_proactive_loop():
+    if not IDLE_PROACTIVE_ENABLED or not IDLE_CHAT_ID:
+        return
+    log("Idle proactive enabled for chat", IDLE_CHAT_ID)
+
+    while True:
+        try:
+            now = int(time.time())
+            last_user = int(meta_get(f"last_user_ts:{IDLE_CHAT_ID}", "0") or 0)
+            last_ping = int(meta_get(f"idle_last_ping:{IDLE_CHAT_ID}", "0") or 0)
+
+            idle_sec = now - last_user if last_user else 0
+            cooldown_ok = (now - last_ping) >= (IDLE_COOLDOWN_MIN * 60)
+            idle_ok = last_user and idle_sec >= (IDLE_AFTER_MIN * 60)
+
+            if idle_ok and cooldown_ok and random.random() < IDLE_PROB:
+                hist = get_history(IDLE_CHAT_ID, 18)
+                user_lines = [m["content"] for m in hist if m["role"] == "user"][-10:]
+                context = "\n".join(user_lines).strip()
+
+                msgs = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content":
+                        "Ты в групповом чате. Тишина уже какое-то время. "
+                        "Напиши коротко (1-2 предложения) что-то живое: "
+                        "вопрос, наблюдение, лёгкий тейк про музыку/аниме. "
+                        "Не начинай с 'я ИИ'. Не говори 'папа/мама'."
+                    },
+                    {"role": "system", "content":
+                        "Если вопрос про даты/новости — честно скажи, что у тебя нет интернета в реальном времени."},
+                    {"role": "user", "content": f"Контекст:\n{context}\n\nСообщение для оживления чата:"}
+                ]
+                text = llm_chat(msgs, max_tokens=140).strip()
+                if text:
+                    text = soften_addressing(strip_memory_dump(text), allow_family=False)
+                    time.sleep(human_read_delay())
+                    typing_sleep(IDLE_CHAT_ID, calc_typing_seconds(text))
+                    send_message(IDLE_CHAT_ID, text, None)
+                    save_message(IDLE_CHAT_ID, "assistant", text, ts=int(time.time()))
+                    meta_set(f"idle_last_ping:{IDLE_CHAT_ID}", str(int(time.time())))
+
+            time.sleep(30)
+
+        except Exception as e:
+            log("idle loop error:", repr(e))
+            time.sleep(60)
 
 # ============================================================
 # Per-chat lock (avoid races)
@@ -712,8 +769,6 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         maybe_learn_display_name(user_id, text)
         learned_alias = maybe_learn_music_alias(user_id, text)
 
-        # stream already saved in webhook; do NOT double-save here
-
         prof = get_profile(user_id) or {}
         display_name = prof.get("display_name") or prof.get("tg_first_name") or None
         relationship = prof.get("relationship") or None
@@ -721,6 +776,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
 
         is_creator = (relationship == "creator")
         is_mother = (relationship == "mother")
+        allow_family = is_creator or is_mother
 
         # Fast answers
         if asks_my_name(text):
@@ -731,7 +787,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             time.sleep(human_read_delay())
             typing_sleep(chat_id, calc_typing_seconds(reply))
             send_message(chat_id, reply, reply_to_message_id)
-            save_message(chat_id, "assistant", reply)
+            save_message(chat_id, "assistant", reply, ts=int(time.time()))
             return
 
         if learned_alias:
@@ -739,7 +795,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             time.sleep(human_read_delay())
             typing_sleep(chat_id, calc_typing_seconds(reply))
             send_message(chat_id, reply, reply_to_message_id)
-            save_message(chat_id, "assistant", reply)
+            save_message(chat_id, "assistant", reply, ts=int(time.time()))
             return
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
@@ -756,6 +812,10 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             card.append(f"relationship=mother. можно иногда обращаться '{MOTHER_NICK}', но не обязана и не всегда.")
         if card:
             messages.append({"role": "system", "content": "Карточка собеседника (не пересказывай её в ответе):\n" + "\n".join(card)})
+
+        now_ts = int(time.time())
+        messages.append({"role": "system", "content": f"Текущее время (UTC unix): {now_ts}. Учитывай паузы и тайминг."})
+        messages.append({"role": "system", "content": "Правило точности: если вопрос про дату/новость/актуальную инфу — говори, что у тебя нет доступа к интернету в реальном времени, и не выдумывай."})
 
         if needs_identity_answer(text):
             messages.append({"role": "system", "content": "Если это вопрос 'кто ты/как тебя зовут/ты ИИ' — ответь кратко."})
@@ -774,17 +834,17 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             reply = "не уловила. перефразируй одним предложением. (・_・;)"
 
         reply = strip_memory_dump(reply)
-        reply = soften_addressing(reply, is_creator=is_creator)
+        reply = soften_addressing(reply, allow_family=allow_family)
 
         time.sleep(human_read_delay())
         parts = split_reply(reply)
 
         for idx, part in enumerate(parts):
             part = strip_memory_dump(part)
-            part = soften_addressing(part, is_creator=is_creator)
+            part = soften_addressing(part, allow_family=allow_family)
             typing_sleep(chat_id, calc_typing_seconds(part))
             send_message(chat_id, part, reply_to_message_id if idx == 0 else None)
-            save_message(chat_id, "assistant", part)
+            save_message(chat_id, "assistant", part, ts=int(time.time()))
             if idx < len(parts) - 1:
                 time.sleep(random.uniform(0.8, 2.2))
 
@@ -816,15 +876,18 @@ def webhook():
     chat_id = chat.get("id")
     from_user = msg.get("from") or {}
     text = (msg.get("text") or "").strip()
+    msg_ts = int(msg.get("date") or time.time())
 
     log("webhook hit chat_id=", chat_id, "from_user_id=", from_user.get("id"), "text=", text[:120])
 
-    # Always store stream (so Yui “listens”)
+    # Always store stream (so Yui “listens”) with Telegram timestamp
     try:
         uid = from_user.get("id")
         if uid:
             upsert_profile_from_tg(from_user)
-            save_user_message_tagged(chat_id, uid, text)
+            save_message(chat_id, "user", text, ts=msg_ts)
+            save_message(chat_id, "user", f"[u:{uid}] {text}", ts=msg_ts)
+            meta_set(f"last_user_ts:{chat_id}", str(msg_ts))
     except Exception as e:
         log("save stream error:", repr(e))
 
@@ -862,3 +925,6 @@ init_db()
 seed_family_profiles()
 refresh_bot_id()
 set_webhook()
+
+if IDLE_PROACTIVE_ENABLED:
+    threading.Thread(target=idle_proactive_loop, daemon=True).start()
