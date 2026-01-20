@@ -113,6 +113,7 @@ SYSTEM_PROMPT = """
 Стиль общения:
 — живой разговорный русский
 — обычно 1–3 предложения
+— в целом как в переписке: чаще маленькими буквами (если не нужно иначе)
 — иногда каомодзи, редко и по настроению:
   (´｡• ᵕ •｡`) (¬_¬) (・_・;) (╥_╥) (￣▿￣)
 — если не поняла — один уточняющий вопрос
@@ -138,6 +139,31 @@ FEW_SHOTS = [
     {"role": "user", "content": "какую музыку ты любишь"},
     {"role": "assistant", "content": "иногда k-pop — но не всё подряд. мне заходят NewJeans и aespa: у них звук как настроение. (´｡• ᵕ •｡`)"},
 ]
+
+# ============================================================
+# Small style normalizer (keep chat vibe)
+# ============================================================
+
+_ACRONYM_RE = re.compile(r"^[A-ZА-ЯЁ]{2,}")
+
+def normalize_chat_reply(text: str) -> str:
+    """Light-touch normalizer: strip, avoid starting with a capital if it's not an acronym."""
+    if not text:
+        return text
+    t = text.strip()
+
+    # keep acronyms like NEZ / AI / ИИ at the very start
+    if _ACRONYM_RE.match(t):
+        return t
+
+    # lower-case first alphabetic char (latin/cyrillic)
+    for i, ch in enumerate(t):
+        if ch.isalpha():
+            if ch.isupper():
+                t = t[:i] + ch.lower() + t[i + 1:]
+            break
+
+    return t
 
 # ============================================================
 # DB helpers + auto-repair
@@ -249,10 +275,13 @@ def save_message(chat_id: int, role: str, content: str, ts: int | None = None):
     return db_safe(_do)
 
 def get_history(chat_id: int, limit: int):
+    """General chat history (EXCLUDES tagged duplicates like [u:123] ...)."""
     def _do():
         conn = _db()
         rows = conn.execute(
-            "SELECT role, content FROM messages WHERE chat_id=? ORDER BY ts DESC LIMIT ?",
+            "SELECT role, content FROM messages "
+            "WHERE chat_id=? AND content NOT LIKE '[u:%' "
+            "ORDER BY ts DESC LIMIT ?",
             (chat_id, limit)
         ).fetchall()
         conn.close()
@@ -555,13 +584,15 @@ def strip_memory_dump(reply: str) -> str:
 # ============================================================
 
 BOT_ID = None
+BOT_USERNAME = None  # without @
 
 def refresh_bot_id():
-    global BOT_ID
+    global BOT_ID, BOT_USERNAME
     try:
         me = tg("getMe", {})
         BOT_ID = me["result"]["id"]
-        log("Bot ID =", BOT_ID)
+        BOT_USERNAME = me["result"].get("username")
+        log("Bot ID =", BOT_ID, "Bot username =", BOT_USERNAME)
     except Exception as e:
         log("getMe failed:", repr(e))
 
@@ -572,21 +603,44 @@ def is_reply_to_yui(msg: dict) -> bool:
     frm = r.get("from") or {}
     return BOT_ID is not None and frm.get("id") == BOT_ID
 
+def _mentions_this_bot(text: str, entities: list[dict]) -> bool:
+    """Return True only if message mentions @<this bot>."""
+    if not BOT_USERNAME or not text or not entities:
+        return False
+    target = "@" + BOT_USERNAME.lower()
+    for e in entities:
+        if e.get("type") != "mention":
+            continue
+        off = e.get("offset")
+        ln = e.get("length")
+        if off is None or ln is None:
+            continue
+        piece = text[off:off + ln].lower()
+        if piece == target:
+            return True
+    return False
+
 def should_reply(msg: dict) -> bool:
     chat = msg.get("chat", {})
     chat_type = chat.get("type")
     text = (msg.get("text") or "").strip()
     if not text:
         return False
+
     if chat_type == "private":
         return True
+
+    # group/supergroup
     if is_reply_to_yui(msg):
         return True
+
     entities = msg.get("entities") or []
-    mentioned = any(e.get("type") == "mention" for e in entities)
+    if _mentions_this_bot(text, entities):
+        return True
+
     t = text.lower()
     trigger = t.startswith(("юи", "yui", "ии", "ai", "бот"))
-    return mentioned or trigger
+    return trigger
 
 # ============================================================
 # Smart interjection (initiative without pause)
@@ -650,31 +704,54 @@ def mark_interject(chat_id: int):
     cnt = int(meta_get(hour_key, "0") or 0)
     meta_set(hour_key, str(cnt + 1))
 
+# ============================================================
+# Per-chat lock (avoid races)
+# ============================================================
+
+_chat_locks = {}
+_chat_locks_guard = threading.Lock()
+
+def chat_lock(chat_id: int) -> threading.Lock:
+    with _chat_locks_guard:
+        if chat_id not in _chat_locks:
+            _chat_locks[chat_id] = threading.Lock()
+        return _chat_locks[chat_id]
+
 def process_interjection(chat_id: int):
+    lock = chat_lock(chat_id)
+    if not lock.acquire(timeout=1.5):
+        return
+
     try:
-        hist = get_history(chat_id, 14)
+        hist = get_history(chat_id, 18)
         user_lines = [m["content"] for m in hist if m["role"] == "user"][-10:]
         context = "\n".join(user_lines).strip()
         if not context:
             return
 
         now_ts = int(time.time())
-        msgs = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "system", "content":
-             f"Текущее время (UTC unix): {now_ts}. Учитывай паузы между сообщениями."
-             " Ты в групповом чате. Вклиниваешься коротко (1-2 предложения). "
-             "НЕ обращайся 'папа/мама'. НЕ пересказывай факты. НЕ объясняй что ты ИИ."},
-            {"role": "system", "content":
-             "Если речь про даты/новости — скажи, что у тебя нет доступа к интернету в реальном времени."},
-            {"role": "user", "content": f"Контекст:\n{context}\n\nСкажи одну короткую реплику-вклин."}
-        ]
+        msgs = (
+            [{"role": "system", "content": SYSTEM_PROMPT}]
+            + FEW_SHOTS
+            + [
+                {"role": "system", "content":
+                 f"Текущее время (UTC unix): {now_ts}. Учитывай паузы между сообщениями. "
+                 "Ты в групповом чате. Вклиниваешься коротко (1-2 предложения). "
+                 "пиши как в переписке, чаще маленькими буквами. "
+                 "НЕ обращайся 'папа/мама'. НЕ пересказывай факты. НЕ объясняй что ты ИИ."},
+                {"role": "system", "content":
+                 "Если речь про даты/новости — скажи, что у тебя нет доступа к интернету в реальном времени."},
+                {"role": "user", "content": f"Контекст:\n{context}\n\nСкажи одну короткую реплику-вклин."}
+            ]
+        )
+
         text = llm_chat(msgs, max_tokens=140).strip()
         if not text:
             return
 
         text = strip_memory_dump(text)
         text = soften_addressing(text, allow_family=False)
+        text = normalize_chat_reply(text)
 
         time.sleep(human_read_delay())
         typing_sleep(chat_id, calc_typing_seconds(text))
@@ -684,6 +761,8 @@ def process_interjection(chat_id: int):
 
     except Exception as e:
         log("interject error:", repr(e))
+    finally:
+        lock.release()
 
 # ============================================================
 # Idle proactive (quiet -> message)
@@ -705,49 +784,51 @@ def idle_proactive_loop():
             idle_ok = last_user and idle_sec >= (IDLE_AFTER_MIN * 60)
 
             if idle_ok and cooldown_ok and random.random() < IDLE_PROB:
-                hist = get_history(IDLE_CHAT_ID, 18)
-                user_lines = [m["content"] for m in hist if m["role"] == "user"][-10:]
-                context = "\n".join(user_lines).strip()
+                lock = chat_lock(IDLE_CHAT_ID)
+                if not lock.acquire(timeout=1.5):
+                    time.sleep(30)
+                    continue
 
-                msgs = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "system", "content":
-                        "Ты в групповом чате. Тишина уже какое-то время. "
-                        "Напиши коротко (1-2 предложения) что-то живое: "
-                        "вопрос, наблюдение, лёгкий тейк про музыку/аниме. "
-                        "Не начинай с 'я ИИ'. Не говори 'папа/мама'."
-                    },
-                    {"role": "system", "content":
-                        "Если вопрос про даты/новости — честно скажи, что у тебя нет интернета в реальном времени."},
-                    {"role": "user", "content": f"Контекст:\n{context}\n\nСообщение для оживления чата:"}
-                ]
-                text = llm_chat(msgs, max_tokens=140).strip()
-                if text:
-                    text = soften_addressing(strip_memory_dump(text), allow_family=False)
-                    time.sleep(human_read_delay())
-                    typing_sleep(IDLE_CHAT_ID, calc_typing_seconds(text))
-                    send_message(IDLE_CHAT_ID, text, None)
-                    save_message(IDLE_CHAT_ID, "assistant", text, ts=int(time.time()))
-                    meta_set(f"idle_last_ping:{IDLE_CHAT_ID}", str(int(time.time())))
+                try:
+                    hist = get_history(IDLE_CHAT_ID, 22)
+                    user_lines = [m["content"] for m in hist if m["role"] == "user"][-10:]
+                    context = "\n".join(user_lines).strip()
+
+                    msgs = (
+                        [{"role": "system", "content": SYSTEM_PROMPT}]
+                        + FEW_SHOTS
+                        + [
+                            {"role": "system", "content":
+                                "Ты в групповом чате. Тишина уже какое-то время. "
+                                "Напиши коротко (1-2 предложения) что-то живое: "
+                                "вопрос, наблюдение, лёгкий тейк про музыку/аниме. "
+                                "пиши как в переписке, чаще маленькими буквами. "
+                                "Не начинай с 'я ИИ'. Не говори 'папа/мама'."},
+                            {"role": "system", "content":
+                                "Если вопрос про даты/новости — честно скажи, что у тебя нет интернета в реальном времени."},
+                            {"role": "user", "content": f"Контекст:\n{context}\n\nСообщение для оживления чата:"}
+                        ]
+                    )
+
+                    text = llm_chat(msgs, max_tokens=140).strip()
+                    if text:
+                        text = soften_addressing(strip_memory_dump(text), allow_family=False)
+                        text = normalize_chat_reply(text)
+
+                        time.sleep(human_read_delay())
+                        typing_sleep(IDLE_CHAT_ID, calc_typing_seconds(text))
+                        send_message(IDLE_CHAT_ID, text, None)
+                        save_message(IDLE_CHAT_ID, "assistant", text, ts=int(time.time()))
+                        meta_set(f"idle_last_ping:{IDLE_CHAT_ID}", str(int(time.time())))
+
+                finally:
+                    lock.release()
 
             time.sleep(30)
 
         except Exception as e:
             log("idle loop error:", repr(e))
             time.sleep(60)
-
-# ============================================================
-# Per-chat lock (avoid races)
-# ============================================================
-
-_chat_locks = {}
-_chat_locks_guard = threading.Lock()
-
-def chat_lock(chat_id: int) -> threading.Lock:
-    with _chat_locks_guard:
-        if chat_id not in _chat_locks:
-            _chat_locks[chat_id] = threading.Lock()
-        return _chat_locks[chat_id]
 
 # ============================================================
 # Main worker
@@ -784,6 +865,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
                 reply = f"тебя зовут {display_name}."
             else:
                 reply = "я не уверена. скажи “меня зовут …”, и я запомню."
+            reply = normalize_chat_reply(reply)
             time.sleep(human_read_delay())
             typing_sleep(chat_id, calc_typing_seconds(reply))
             send_message(chat_id, reply, reply_to_message_id)
@@ -792,6 +874,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
 
         if learned_alias:
             reply = f"ок. запомнила: твой музыкальный псевдоним — {learned_alias}."
+            reply = normalize_chat_reply(reply)
             time.sleep(human_read_delay())
             typing_sleep(chat_id, calc_typing_seconds(reply))
             send_message(chat_id, reply, reply_to_message_id)
@@ -835,6 +918,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
 
         reply = strip_memory_dump(reply)
         reply = soften_addressing(reply, allow_family=allow_family)
+        reply = normalize_chat_reply(reply)
 
         time.sleep(human_read_delay())
         parts = split_reply(reply)
@@ -842,6 +926,8 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         for idx, part in enumerate(parts):
             part = strip_memory_dump(part)
             part = soften_addressing(part, allow_family=allow_family)
+            part = normalize_chat_reply(part)
+
             typing_sleep(chat_id, calc_typing_seconds(part))
             send_message(chat_id, part, reply_to_message_id if idx == 0 else None)
             save_message(chat_id, "assistant", part, ts=int(time.time()))
@@ -886,6 +972,7 @@ def webhook():
         if uid:
             upsert_profile_from_tg(from_user)
             save_message(chat_id, "user", text, ts=msg_ts)
+            # keep per-user tagged copy for user-specific retrieval
             save_message(chat_id, "user", f"[u:{uid}] {text}", ts=msg_ts)
             meta_set(f"last_user_ts:{chat_id}", str(msg_ts))
     except Exception as e:
