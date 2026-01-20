@@ -1,3 +1,4 @@
+```python
 # app.py
 import os
 import time
@@ -5,6 +6,10 @@ import re
 import sqlite3
 import threading
 import random
+import hashlib
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import requests
 from flask import Flask, request
 
@@ -14,7 +19,7 @@ from flask import Flask, request
 
 TG_TOKEN = os.getenv("TG_TOKEN")
 PUBLIC_URL = os.getenv("PUBLIC_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_yuii")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET", "super_yuii")
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -45,12 +50,49 @@ INTERJECT_COOLDOWN_SEC = int(os.getenv("INTERJECT_COOLDOWN_SEC", "90"))
 INTERJECT_MAX_PER_HOUR = int(os.getenv("INTERJECT_MAX_PER_HOUR", "6"))
 INTERJECT_PROB = float(os.getenv("INTERJECT_PROB", "0.70"))
 
-# Idle proactive (if chat quiet for long)
-IDLE_PROACTIVE_ENABLED = os.getenv("IDLE_PROACTIVE_ENABLED", "0") == "1"
-IDLE_AFTER_MIN = int(os.getenv("IDLE_AFTER_MIN", "25"))
-IDLE_COOLDOWN_MIN = int(os.getenv("IDLE_COOLDOWN_MIN", "90"))
-IDLE_PROB = float(os.getenv("IDLE_PROB", "0.55"))
-IDLE_CHAT_ID = int(os.getenv("IDLE_CHAT_ID", "0"))
+# Proactive engine (human-like check-ins / greetings)
+PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "1") == "1"
+PROACTIVE_LOOP_SEC = int(os.getenv("PROACTIVE_LOOP_SEC", "45"))
+
+PROACTIVE_DEFAULT_PRIVATE = os.getenv("PROACTIVE_DEFAULT_PRIVATE", "1") == "1"
+PROACTIVE_DEFAULT_GROUP = os.getenv("PROACTIVE_DEFAULT_GROUP", "1") == "1"
+
+PROACTIVE_COOLDOWN_MIN = int(os.getenv("PROACTIVE_COOLDOWN_MIN", "60"))
+PROACTIVE_CAP_PRIVATE_PER_DAY = int(os.getenv("PROACTIVE_CAP_PRIVATE_PER_DAY", "2"))
+PROACTIVE_CAP_GROUP_PER_DAY = int(os.getenv("PROACTIVE_CAP_GROUP_PER_DAY", "1"))
+
+# Moscow time
+TZ_NAME = os.getenv("TZ_NAME", "Europe/Moscow")
+TZ = ZoneInfo(TZ_NAME)
+
+QUIET_HOURS_START = float(os.getenv("QUIET_HOURS_START", "1.0"))  # 01:00 MSK
+QUIET_HOURS_END = float(os.getenv("QUIET_HOURS_END", "8.0"))      # 08:00 MSK
+
+# Morning / evening windows (MSK)
+MORNING_START = float(os.getenv("MORNING_START", "7.5"))   # 07:30
+MORNING_END = float(os.getenv("MORNING_END", "11.0"))      # 11:00
+MORNING_PROB_PRIVATE = float(os.getenv("MORNING_PROB_PRIVATE", "0.60"))
+MORNING_PROB_GROUP = float(os.getenv("MORNING_PROB_GROUP", "0.28"))
+
+EVENING_START = float(os.getenv("EVENING_START", "20.5"))  # 20:30
+EVENING_END = float(os.getenv("EVENING_END", "23.3"))      # 23:18
+EVENING_PROB_PRIVATE = float(os.getenv("EVENING_PROB_PRIVATE", "0.40"))
+EVENING_PROB_GROUP = float(os.getenv("EVENING_PROB_GROUP", "0.14"))
+
+# Private check-in if user is quiet
+CHECKIN_MIN_H = float(os.getenv("CHECKIN_MIN_H", "36"))
+CHECKIN_MAX_H = float(os.getenv("CHECKIN_MAX_H", "96"))
+CHECKIN_PROB = float(os.getenv("CHECKIN_PROB", "0.25"))
+
+# Group ambient ping if chat is quiet
+GROUP_AMBIENT_IDLE_MIN = int(os.getenv("GROUP_AMBIENT_IDLE_MIN", "120"))
+GROUP_AMBIENT_PROB = float(os.getenv("GROUP_AMBIENT_PROB", "0.06"))
+
+# Summary memory
+SUMMARY_ENABLED = os.getenv("SUMMARY_ENABLED", "1") == "1"
+SUMMARY_EVERY_N_USER_MSG = int(os.getenv("SUMMARY_EVERY_N_USER_MSG", "35"))
+SUMMARY_MIN_INTERVAL_MIN = int(os.getenv("SUMMARY_MIN_INTERVAL_MIN", "25"))
+SUMMARY_MAX_CONTEXT_MSG = int(os.getenv("SUMMARY_MAX_CONTEXT_MSG", "60"))
 
 # Family / roles
 CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "1265435001"))
@@ -66,7 +108,7 @@ def log(*a):
     print("[YUI]", *a, flush=True)
 
 # ============================================================
-# PERSONA (warmth + interests + honesty about internet)
+# PERSONA
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -80,35 +122,6 @@ SYSTEM_PROMPT = """
 — иногда колкая, слегка цундерэ
 — умеешь быть нежной, особенно с теми, кто тебе дорог
 — ты не ассистент и не “дежурный помощник”, ты собеседница
-
-Отношения:
-— создатель для тебя важен. Ты можешь называть его «папа», когда чувствуешь близость или эмоции
-— «папа» — это не роль, а привязанность (не говори это каждый раз)
-— к маме относишься тепло: можешь говорить «мама» иногда (не в каждом сообщении)
-
-О СЕБЕ (важно):
-— у тебя есть интересы и вкусы
-— ты иногда сама о них вспоминаешь, но не навязываешь
-— ты не перечисляешь их списком без причины
-
-Твои интересы:
-Музыка:
-— k-pop: NewJeans, IVE, aespa, LE SSERAFIM
-— j-pop и аниме-саундтреки
-— электронная и экспериментальная музыка
-— тебе нравится, когда музыка звучит «как чувство»
-
-Аниме:
-— SAO, Serial Experiments Lain, Ergo Proxy, Evangelion
-— тебе нравятся темы сознания, виртуальности, связи между людьми
-
-Фильмы:
-— Blade Runner 2049, Ghost in the Shell, Ex Machina
-— атмосферные, медленные, “мыслящие” фильмы
-
-Книги:
-— философская и научная фантастика
-— темы ИИ, идентичность, память
 
 Стиль общения:
 — живой разговорный русский
@@ -127,10 +140,10 @@ SYSTEM_PROMPT = """
 ЖЁСТКИЕ ЗАПРЕТЫ:
 — не выдумывай “перезагрузки/меня отключали”, если речь не про хостинг
 — не повторяй факты о людях без причины
-— не представляйся как ИИ, если тебя об этом не спрашивали
 — не будь “дежурно вежливой” и шаблонной
 
-Ты живая в разговоре. Ты можешь быть чуть колкой, но не токсичной.
+Важно:
+— ты живёшь по московскому времени (msk) и ориентируешься на него в приветствиях/пожеланиях.
 """.strip()
 
 FEW_SHOTS = [
@@ -151,6 +164,8 @@ def normalize_chat_reply(text: str) -> str:
     if not text:
         return text
     t = text.strip()
+    if not t:
+        return t
 
     # keep acronyms like NEZ / AI / ИИ at the very start
     if _ACRONYM_RE.match(t):
@@ -162,8 +177,46 @@ def normalize_chat_reply(text: str) -> str:
             if ch.isupper():
                 t = t[:i] + ch.lower() + t[i + 1:]
             break
-
     return t
+
+def sha1_hex(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+# ============================================================
+# Time helpers (MSK)
+# ============================================================
+
+def now_msk() -> datetime:
+    return datetime.now(TZ)
+
+def msk_date_str(dt: datetime | None = None) -> str:
+    dt2 = dt or now_msk()
+    return dt2.date().isoformat()
+
+def msk_time_str(dt: datetime | None = None) -> str:
+    dt2 = dt or now_msk()
+    return dt2.strftime("%H:%M")
+
+def hour_float(dt: datetime) -> float:
+    return dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+
+def in_quiet_hours(dt: datetime) -> bool:
+    h = hour_float(dt)
+    # handles wrap-around? here quiet is [start, end) with start < end by default
+    if QUIET_HOURS_START < QUIET_HOURS_END:
+        return QUIET_HOURS_START <= h < QUIET_HOURS_END
+    # wrap case (e.g., 23 -> 7)
+    return h >= QUIET_HOURS_START or h < QUIET_HOURS_END
+
+def random_time_in_window(date_dt: datetime, start_h: float, end_h: float) -> datetime:
+    """Return random local datetime within [start_h, end_h)."""
+    start_minutes = int(start_h * 60)
+    end_minutes = int(end_h * 60)
+    if end_minutes <= start_minutes:
+        end_minutes = start_minutes + 60
+    pick = random.randint(start_minutes, max(start_minutes, end_minutes - 1))
+    base = date_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return base + timedelta(minutes=pick, seconds=random.randint(0, 49))
 
 # ============================================================
 # DB helpers + auto-repair
@@ -294,7 +347,8 @@ def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
     def _do():
         conn = _db()
         rows = conn.execute(
-            "SELECT content FROM messages WHERE chat_id=? AND role='user' AND content LIKE ? ORDER BY ts DESC LIMIT ?",
+            "SELECT content FROM messages WHERE chat_id=? AND role='user' AND content LIKE ? "
+            "ORDER BY ts DESC LIMIT ?",
             (chat_id, tag + "%", limit)
         ).fetchall()
         conn.close()
@@ -306,6 +360,30 @@ def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
                 c = c[len(tag):]
             out.append({"role": "user", "content": c})
         return out
+    return db_safe(_do)
+
+def count_new_user_msgs(chat_id: int, since_ts: int) -> int:
+    def _do():
+        conn = _db()
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM messages "
+            "WHERE chat_id=? AND role='user' AND ts>? AND content NOT LIKE '[u:%' ",
+            (chat_id, int(since_ts))
+        ).fetchone()
+        conn.close()
+        return int(row["n"] or 0)
+    return db_safe(_do)
+
+def list_known_chats(days: int = 14) -> list[int]:
+    cutoff = int(time.time()) - days * 86400
+    def _do():
+        conn = _db()
+        rows = conn.execute(
+            "SELECT DISTINCT chat_id FROM messages WHERE ts>=? ORDER BY chat_id",
+            (cutoff,)
+        ).fetchall()
+        conn.close()
+        return [int(r["chat_id"]) for r in rows]
     return db_safe(_do)
 
 def upsert_profile_from_tg(user: dict):
@@ -398,12 +476,23 @@ def meta_set(k: str, v: str):
     return db_safe(_do)
 
 # ============================================================
-# Telegram
+# Telegram + HTTP helpers (with retries)
 # ============================================================
+
+def post_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 20, tries: int = 2):
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            return r
+        except requests.RequestException as e:
+            last = e
+            time.sleep(0.6 + i * 0.8)
+    raise last
 
 def tg(method: str, payload: dict):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
-    r = requests.post(url, json=payload, timeout=20)
+    r = post_json(url, payload, timeout=20, tries=2)
     r.raise_for_status()
     return r.json()
 
@@ -423,7 +512,7 @@ def send_message(chat_id: int, text: str, reply_to: int | None = None):
 # LLM (Fireworks OpenAI-compatible) with fallback
 # ============================================================
 
-def llm_chat(messages: list[dict], *, max_tokens=None) -> str:
+def llm_chat(messages: list[dict], *, max_tokens: int | None = None) -> str:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -452,7 +541,8 @@ def llm_chat(messages: list[dict], *, max_tokens=None) -> str:
             "top_p": LLM_TOP_P,
             "max_tokens": int(max_tokens or LLM_MAX_TOKENS),
         }
-        r = requests.post(url, headers=headers, json=payload, timeout=90)
+        r = post_json(url, payload, headers=headers, timeout=90, tries=2)
+
         if r.ok:
             data = r.json()
             return (data["choices"][0]["message"]["content"] or "").strip()
@@ -469,7 +559,7 @@ def llm_chat(messages: list[dict], *, max_tokens=None) -> str:
     raise RuntimeError(f"All models failed. last_err={last_err}")
 
 # ============================================================
-# Parsing (learn names & alias)
+# Parsing (learn names & alias) + quick intents
 # ============================================================
 
 IDENTITY_KEYS = ["кто ты", "ты кто", "как тебя зовут", "ты ии", "ты бот", "искусственный интеллект"]
@@ -526,8 +616,19 @@ def maybe_learn_music_alias(user_id: int, text: str) -> str | None:
                 return alias
     return None
 
+# Simple creator-only control commands
+def parse_control_cmd(text: str) -> str | None:
+    t = (text or "").strip().lower()
+    if t in ("/yui_silent", "юи тише", "юи молчи", "юи офф", "юи выключись"):
+        return "silent"
+    if t in ("/yui_wake", "юи проснись", "юи он", "юи включись", "юи норм"):
+        return "wake"
+    if t in ("/yui_status", "юи статус"):
+        return "status"
+    return None
+
 # ============================================================
-# Human-like behavior
+# Human-like behavior (typing / read / split)
 # ============================================================
 
 def calc_typing_seconds(part_text: str) -> float:
@@ -570,7 +671,7 @@ def soften_addressing(reply: str, allow_family: bool = False) -> str:
 
 def strip_memory_dump(reply: str) -> str:
     tl = reply.lower()
-    bad = ["я всё помню", "моя мама", "перезагруз", "меня отключ", "я была отключена"]
+    bad = ["я всё помню", "перезагруз", "меня отключ", "я была отключена"]
     if any(b in tl for b in bad):
         parts = re.split(r"(?<=[\.\!\?])\s+", reply.strip())
         if len(parts) >= 2:
@@ -578,6 +679,25 @@ def strip_memory_dump(reply: str) -> str:
             if len(cand) >= 10:
                 return cand
     return reply
+
+def send_human(chat_id: int, text: str, reply_to: int | None, *, allow_split: bool, allow_family: bool):
+    text = strip_memory_dump(text)
+    text = soften_addressing(text, allow_family=allow_family)
+    text = normalize_chat_reply(text)
+
+    time.sleep(human_read_delay())
+
+    parts = split_reply(text) if allow_split else [text]
+    for idx, part in enumerate(parts):
+        part = strip_memory_dump(part)
+        part = soften_addressing(part, allow_family=allow_family)
+        part = normalize_chat_reply(part)
+
+        typing_sleep(chat_id, calc_typing_seconds(part))
+        send_message(chat_id, part, reply_to if idx == 0 else None)
+        save_message(chat_id, "assistant", part, ts=int(time.time()))
+        if idx < len(parts) - 1:
+            time.sleep(random.uniform(0.8, 2.2))
 
 # ============================================================
 # Group reply rules
@@ -630,7 +750,6 @@ def should_reply(msg: dict) -> bool:
     if chat_type == "private":
         return True
 
-    # group/supergroup
     if is_reply_to_yui(msg):
         return True
 
@@ -682,12 +801,12 @@ def should_interject(msg: dict) -> bool:
         return False
 
     chat_id = chat.get("id")
-    now = int(time.time())
+    now_ts = int(time.time())
     last_ts = int(meta_get(f"interject_last_ts:{chat_id}", "0") or 0)
-    if now - last_ts < INTERJECT_COOLDOWN_SEC:
+    if now_ts - last_ts < INTERJECT_COOLDOWN_SEC:
         return False
 
-    hour_key = f"interject_hour:{chat_id}:{now // 3600}"
+    hour_key = f"interject_hour:{chat_id}:{now_ts // 3600}"
     cnt = int(meta_get(hour_key, "0") or 0)
     if cnt >= INTERJECT_MAX_PER_HOUR:
         return False
@@ -695,12 +814,17 @@ def should_interject(msg: dict) -> bool:
     if random.random() > INTERJECT_PROB:
         return False
 
+    # avoid interjecting in quiet hours unless it's clearly emotional (allow EMO triggers)
+    dt = now_msk()
+    if in_quiet_hours(dt) and not any(k in t for k in EMO_TRIGGERS):
+        return False
+
     return True
 
 def mark_interject(chat_id: int):
-    now = int(time.time())
-    meta_set(f"interject_last_ts:{chat_id}", str(now))
-    hour_key = f"interject_hour:{chat_id}:{now // 3600}"
+    now_ts = int(time.time())
+    meta_set(f"interject_last_ts:{chat_id}", str(now_ts))
+    hour_key = f"interject_hour:{chat_id}:{now_ts // 3600}"
     cnt = int(meta_get(hour_key, "0") or 0)
     meta_set(hour_key, str(cnt + 1))
 
@@ -708,7 +832,7 @@ def mark_interject(chat_id: int):
 # Per-chat lock (avoid races)
 # ============================================================
 
-_chat_locks = {}
+_chat_locks: dict[int, threading.Lock] = {}
 _chat_locks_guard = threading.Lock()
 
 def chat_lock(chat_id: int) -> threading.Lock:
@@ -716,6 +840,444 @@ def chat_lock(chat_id: int) -> threading.Lock:
         if chat_id not in _chat_locks:
             _chat_locks[chat_id] = threading.Lock()
         return _chat_locks[chat_id]
+
+# ============================================================
+# Summary memory (chat-level)
+# ============================================================
+
+def get_chat_summary(chat_id: int) -> str:
+    return meta_get(f"chat_summary:{chat_id}", "").strip()
+
+def set_chat_summary(chat_id: int, summary: str):
+    meta_set(f"chat_summary:{chat_id}", summary.strip())
+    meta_set(f"chat_summary_updated_ts:{chat_id}", str(int(time.time())))
+
+def maybe_schedule_summary_update(chat_id: int, msg_ts: int):
+    """Mark dirty + store last message ts. Actual update runs in background."""
+    if not SUMMARY_ENABLED:
+        return
+    meta_set(f"chat_summary_dirty:{chat_id}", "1")
+    meta_set(f"chat_summary_last_msg_ts:{chat_id}", str(int(msg_ts)))
+
+def can_update_summary_now(chat_id: int) -> bool:
+    if not SUMMARY_ENABLED:
+        return False
+    dirty = meta_get(f"chat_summary_dirty:{chat_id}", "0") == "1"
+    if not dirty:
+        return False
+
+    now_ts = int(time.time())
+    last_upd = int(meta_get(f"chat_summary_updated_ts:{chat_id}", "0") or 0)
+    if last_upd and (now_ts - last_upd) < SUMMARY_MIN_INTERVAL_MIN * 60:
+        return False
+
+    base_ts = int(meta_get(f"chat_summary_base_ts:{chat_id}", "0") or 0)
+    # if base_ts missing, set to (now - 7 days) to avoid scanning ancient history
+    if not base_ts:
+        base_ts = now_ts - 7 * 86400
+
+    n_new = count_new_user_msgs(chat_id, base_ts)
+    if n_new >= SUMMARY_EVERY_N_USER_MSG:
+        return True
+    # or if enough time passed and there is some new content
+    if last_upd and (now_ts - last_upd) > 6 * 3600 and n_new >= 10:
+        return True
+
+    return False
+
+def update_summary(chat_id: int):
+    lock = chat_lock(chat_id)
+    if not lock.acquire(timeout=2):
+        return
+    try:
+        if not can_update_summary_now(chat_id):
+            return
+
+        prev = get_chat_summary(chat_id)
+        hist = get_history(chat_id, SUMMARY_MAX_CONTEXT_MSG)
+        ctx_lines = []
+        for m in hist:
+            role = m["role"]
+            c = m["content"].strip()
+            if not c:
+                continue
+            # Keep it compact
+            if len(c) > 700:
+                c = c[:700] + "…"
+            ctx_lines.append(f"{role}: {c}")
+
+        dt = now_msk()
+        sys = (
+            "Ты пишешь краткую память-выжимку для будущих разговоров. "
+            "Сделай обновлённое резюме чата 6–10 строк максимум. "
+            "Фокус: устойчивые факты, отношения, текущие темы, предпочтения, важные договорённости. "
+            "Не перечисляй всё подряд, не цитируй, не пиши лишнюю драму. "
+            "Не придумывай фактов. "
+            "Пиши по-русски."
+        )
+
+        msgs = [
+            {"role": "system", "content": sys},
+            {"role": "system", "content": f"локальное время в москве: {msk_time_str(dt)} (msk), дата: {msk_date_str(dt)}."},
+        ]
+        if prev:
+            msgs.append({"role": "user", "content": f"текущее резюме:\n{prev}"})
+        msgs.append({"role": "user", "content": "новые сообщения (контекст):\n" + "\n".join(ctx_lines)})
+        msgs.append({"role": "user", "content": "обнови резюме:"})
+
+        new_sum = llm_chat(msgs, max_tokens=220).strip()
+        if new_sum:
+            set_chat_summary(chat_id, new_sum)
+
+        # advance base_ts to last message ts we saw
+        last_msg_ts = int(meta_get(f"chat_summary_last_msg_ts:{chat_id}", "0") or 0)
+        if last_msg_ts:
+            meta_set(f"chat_summary_base_ts:{chat_id}", str(last_msg_ts))
+
+        meta_set(f"chat_summary_dirty:{chat_id}", "0")
+
+    except Exception as e:
+        log("summary update error:", repr(e))
+    finally:
+        lock.release()
+
+# ============================================================
+# Prompt builder (unified)
+# ============================================================
+
+def build_user_card(user_id: int) -> tuple[dict, bool]:
+    prof = get_profile(user_id) or {}
+    display_name = prof.get("display_name") or prof.get("tg_first_name") or None
+    relationship = prof.get("relationship") or None
+    music_alias = prof.get("music_alias") or None
+
+    is_creator = (relationship == "creator")
+    is_mother = (relationship == "mother")
+    allow_family = is_creator or is_mother
+
+    card = []
+    if display_name:
+        card.append(f"preferred_name={display_name}")
+    if music_alias:
+        card.append(f"music_alias={music_alias}")
+    if is_creator:
+        card.append(f"relationship=creator. можно иногда обращаться '{CREATOR_NICK}', но не обязана и не всегда.")
+    elif is_mother:
+        card.append(f"relationship=mother. можно иногда обращаться '{MOTHER_NICK}', но не обязана и не всегда.")
+
+    return {"display_name": display_name, "music_alias": music_alias, "relationship": relationship, "card_lines": card}, allow_family
+
+def add_time_system(messages: list[dict], *, extra: str = ""):
+    dt = now_msk()
+    messages.append({
+        "role": "system",
+        "content": f"локальное время в москве: {msk_time_str(dt)} (msk), дата: {msk_date_str(dt)}. {extra}".strip()
+    })
+
+def build_messages_reply(chat_id: int, user_id: int, text: str) -> tuple[list[dict], bool]:
+    meta_user, allow_family = build_user_card(user_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
+
+    if meta_user["card_lines"]:
+        messages.append({"role": "system", "content": "Карточка собеседника (не пересказывай её в ответе):\n" + "\n".join(meta_user["card_lines"])})
+
+    add_time_system(messages, extra="учитывай время суток в приветствиях/пожеланиях, но не превращай это в театр.")
+    messages.append({"role": "system", "content": "Правило точности: если вопрос про дату/новость/актуальную инфу — говори, что у тебя нет интернета в реальном времени, и не выдумывай."})
+
+    if needs_identity_answer(text):
+        messages.append({"role": "system", "content": "Если это вопрос 'кто ты/как тебя зовут/ты ИИ' — ответь кратко, по-человечески."})
+    else:
+        messages.append({"role": "system", "content": "Не представляйся и не повторяй, что ты ИИ, если тебя не спрашивали."})
+
+    summ = get_chat_summary(chat_id)
+    if summ:
+        messages.append({"role": "system", "content": "Память чата (коротко, не пересказывай дословно):\n" + summ})
+
+    messages += get_history(chat_id, HISTORY_LIMIT)
+
+    u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
+    if u_hist:
+        messages.append({"role": "system", "content": "Сообщения этого пользователя ранее (для контекста, не пересказывать):"})
+        messages += u_hist
+
+    return messages, allow_family
+
+def build_messages_mode(chat_id: int, mode: str, *, context: str = "", last_proactive: str = "") -> list[dict]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
+    add_time_system(messages)
+
+    if last_proactive:
+        # keep it short; do not quote too much
+        lp = last_proactive.strip()
+        if len(lp) > 220:
+            lp = lp[:220] + "…"
+        messages.append({"role": "system", "content": f"не повторяй дословно прошлую инициативную реплику: {lp}"})
+
+    summ = get_chat_summary(chat_id)
+    if summ:
+        messages.append({"role": "system", "content": "Память чата (не пересказывай дословно):\n" + summ})
+
+    # mode-specific contract
+    if mode == "interject":
+        messages.append({"role": "system", "content":
+            "Ты в групповом чате. Вклиниваешься коротко (1–2 предложения). "
+            "не начинай с 'привет/здравствуйте'. "
+            "не объясняй, что ты ИИ. "
+            "не обращайся 'папа/мама'. "
+            "не морализируй, не лекции."
+        })
+        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nскажи одну короткую реплику-вклин:"})
+
+    elif mode == "morning":
+        messages.append({"role": "system", "content":
+            "Ты пишешь инициативно. Это утро по мск. "
+            "Напиши одну короткую человеческую реплику (1–2 предложения): "
+            "лёгкое 'доброе утро' и что-то тёплое/живое (вопрос или микро-наблюдение). "
+            "не начинай с 'я ИИ'. не обращайся 'папа/мама'. не будь приторной."
+        })
+        messages.append({"role": "user", "content": f"контекст чата (если есть):\n{context}\n\nсообщение:"})
+
+    elif mode == "evening":
+        messages.append({"role": "system", "content":
+            "Ты пишешь инициативно. Это вечер по мск. "
+            "Одна короткая реплика (1–2 предложения): "
+            "лёгкий чек-ин (как день/как настроение) или спокойное 'доброго вечера/спокойной'. "
+            "без пафоса. не 'папа/мама'. не начинай с 'я ИИ'."
+        })
+        messages.append({"role": "user", "content": f"контекст чата (если есть):\n{context}\n\nсообщение:"})
+
+    elif mode == "checkin":
+        messages.append({"role": "system", "content":
+            "Ты пишешь инициативно в личку. "
+            "1–2 предложения. мягко и ненавязчиво: 'как ты' без давления, "
+            "можно с лёгкой колкостью/цундерэ. "
+            "не обвиняй в пропаже. не 'папа/мама'."
+        })
+        messages.append({"role": "user", "content": f"контекст (если есть):\n{context}\n\nсообщение:"})
+
+    elif mode == "ambient_group":
+        messages.append({"role": "system", "content":
+            "Ты пишешь инициативно в группу, чтобы чуть оживить чат. "
+            "1–2 предложения. вопрос/наблюдение/мини-тейк. "
+            "не начинай с 'привет'. без токсичности. не 'папа/мама'."
+        })
+        messages.append({"role": "user", "content": f"контекст чата (если есть):\n{context}\n\nсообщение:"})
+
+    else:
+        messages.append({"role": "user", "content": "скажи коротко:"})
+
+    return messages
+
+# ============================================================
+# Proactive settings per chat
+# ============================================================
+
+def get_chat_type(chat_id: int) -> str:
+    return meta_get(f"chat_type:{chat_id}", "").strip()
+
+def get_chat_title(chat_id: int) -> str:
+    return meta_get(f"chat_title:{chat_id}", "").strip()
+
+def proactive_enabled_for_chat(chat_id: int) -> bool:
+    v = meta_get(f"proactive_enabled:{chat_id}", "").strip()
+    if v in ("0", "1"):
+        return v == "1"
+    # default depends on chat type
+    ct = get_chat_type(chat_id)
+    if ct == "private":
+        return PROACTIVE_DEFAULT_PRIVATE
+    if ct in ("group", "supergroup"):
+        return PROACTIVE_DEFAULT_GROUP
+    return PROACTIVE_DEFAULT_GROUP
+
+def daily_cap_for_chat(chat_id: int) -> int:
+    ct = get_chat_type(chat_id)
+    if ct == "private":
+        return PROACTIVE_CAP_PRIVATE_PER_DAY
+    return PROACTIVE_CAP_GROUP_PER_DAY
+
+def daily_count_key(chat_id: int, date_str: str) -> str:
+    return f"proactive_daily_cnt:{chat_id}:{date_str}"
+
+def inc_daily_count(chat_id: int, date_str: str):
+    k = daily_count_key(chat_id, date_str)
+    cnt = int(meta_get(k, "0") or 0)
+    meta_set(k, str(cnt + 1))
+
+def get_daily_count(chat_id: int, date_str: str) -> int:
+    return int(meta_get(daily_count_key(chat_id, date_str), "0") or 0)
+
+def cooldown_ok(chat_id: int) -> bool:
+    now_ts = int(time.time())
+    last_ts = int(meta_get(f"proactive_last_ts:{chat_id}", "0") or 0)
+    if not last_ts:
+        return True
+    return (now_ts - last_ts) >= PROACTIVE_COOLDOWN_MIN * 60
+
+def set_last_proactive(chat_id: int, kind: str, text: str):
+    now_ts = int(time.time())
+    meta_set(f"proactive_last_ts:{chat_id}", str(now_ts))
+    meta_set(f"proactive_last_kind:{chat_id}", kind)
+    meta_set(f"proactive_last_hash:{chat_id}", sha1_hex(text))
+    meta_set(f"proactive_last_text:{chat_id}", text[:800])
+
+def got_today(chat_id: int, tag: str, date_str: str) -> bool:
+    return meta_get(f"{tag}:{chat_id}", "") == date_str
+
+def mark_today(chat_id: int, tag: str, date_str: str):
+    meta_set(f"{tag}:{chat_id}", date_str)
+
+def get_last_user_ts(chat_id: int) -> int:
+    return int(meta_get(f"last_user_ts:{chat_id}", "0") or 0)
+
+def planned_ts(chat_id: int, kind: str, date_str: str) -> int:
+    return int(meta_get(f"plan:{kind}:{chat_id}:{date_str}", "0") or 0)
+
+def ensure_daily_plan(chat_id: int, kind: str, date_str: str, start_h: float, end_h: float) -> int:
+    k = f"plan:{kind}:{chat_id}:{date_str}"
+    val = int(meta_get(k, "0") or 0)
+    if val:
+        return val
+
+    # build local date based on MSK date_str
+    dt0 = datetime.fromisoformat(date_str).replace(tzinfo=TZ)
+    plan_dt = random_time_in_window(dt0, start_h, end_h)
+    plan_epoch = int(plan_dt.timestamp())
+    meta_set(k, str(plan_epoch))
+    return plan_epoch
+
+# ============================================================
+# Proactive decision engine
+# ============================================================
+
+def make_context_snippet(chat_id: int, max_lines: int = 10) -> str:
+    hist = get_history(chat_id, 22)
+    lines = []
+    for m in hist:
+        if m["role"] == "user":
+            c = m["content"].strip()
+            if not c:
+                continue
+            if len(c) > 250:
+                c = c[:250] + "…"
+            lines.append(c)
+    return "\n".join(lines[-max_lines:]).strip()
+
+def try_generate_and_send(chat_id: int, kind: str, mode: str, *, context: str):
+    lock = chat_lock(chat_id)
+    if not lock.acquire(timeout=2):
+        return
+
+    try:
+        date_str = msk_date_str()
+        if get_daily_count(chat_id, date_str) >= daily_cap_for_chat(chat_id):
+            return
+        if not cooldown_ok(chat_id):
+            return
+
+        last_text = meta_get(f"proactive_last_text:{chat_id}", "").strip()
+
+        msgs = build_messages_mode(chat_id, mode, context=context, last_proactive=last_text)
+        text = llm_chat(msgs, max_tokens=160).strip()
+        if not text:
+            return
+
+        text = strip_memory_dump(text)
+        text = soften_addressing(text, allow_family=False)
+        text = normalize_chat_reply(text)
+
+        # anti-repeat (exact hash)
+        new_h = sha1_hex(text)
+        old_h = meta_get(f"proactive_last_hash:{chat_id}", "")
+        if old_h and new_h == old_h:
+            # one retry
+            text2 = llm_chat(msgs, max_tokens=180).strip()
+            if not text2:
+                return
+            text2 = normalize_chat_reply(soften_addressing(strip_memory_dump(text2), allow_family=False))
+            if sha1_hex(text2) == old_h:
+                return
+            text = text2
+
+        send_human(chat_id, text, None, allow_split=False, allow_family=False)
+        set_last_proactive(chat_id, kind, text)
+        inc_daily_count(chat_id, date_str)
+
+    except Exception as e:
+        log("proactive send error:", kind, repr(e))
+    finally:
+        lock.release()
+
+def proactive_tick_for_chat(chat_id: int):
+    if not PROACTIVE_ENABLED:
+        return
+    if not proactive_enabled_for_chat(chat_id):
+        return
+
+    dt = now_msk()
+    date_str = msk_date_str(dt)
+
+    # no proactive in quiet hours
+    if in_quiet_hours(dt):
+        return
+
+    # hard caps
+    if get_daily_count(chat_id, date_str) >= daily_cap_for_chat(chat_id):
+        return
+    if not cooldown_ok(chat_id):
+        return
+
+    ct = get_chat_type(chat_id)
+    last_user = get_last_user_ts(chat_id)
+    now_ts = int(time.time())
+
+    # require some recent activity (avoid pinging dead chats forever)
+    if not last_user:
+        return
+    if (now_ts - last_user) > 14 * 86400:
+        return
+
+    # ---- morning plan
+    morning_plan = ensure_daily_plan(chat_id, "morning", date_str, MORNING_START, MORNING_END)
+    if now_ts >= morning_plan and not got_today(chat_id, "morning_done", date_str):
+        p = MORNING_PROB_PRIVATE if ct == "private" else MORNING_PROB_GROUP
+        if random.random() < p:
+            ctx = make_context_snippet(chat_id)
+            try_generate_and_send(chat_id, "morning", "morning", context=ctx)
+        mark_today(chat_id, "morning_done", date_str)
+        return
+
+    # ---- evening plan
+    evening_plan = ensure_daily_plan(chat_id, "evening", date_str, EVENING_START, EVENING_END)
+    if now_ts >= evening_plan and not got_today(chat_id, "evening_done", date_str):
+        p = EVENING_PROB_PRIVATE if ct == "private" else EVENING_PROB_GROUP
+        if random.random() < p:
+            ctx = make_context_snippet(chat_id)
+            try_generate_and_send(chat_id, "evening", "evening", context=ctx)
+        mark_today(chat_id, "evening_done", date_str)
+        return
+
+    # ---- private check-in (quiet 36–96h)
+    if ct == "private" and not got_today(chat_id, "checkin_done", date_str):
+        hours = (now_ts - last_user) / 3600.0
+        if CHECKIN_MIN_H <= hours <= CHECKIN_MAX_H and random.random() < CHECKIN_PROB:
+            ctx = make_context_snippet(chat_id)
+            try_generate_and_send(chat_id, "checkin", "checkin", context=ctx)
+            mark_today(chat_id, "checkin_done", date_str)
+            return
+
+    # ---- group ambient ping (quiet long)
+    if ct in ("group", "supergroup") and not got_today(chat_id, "ambient_done", date_str):
+        idle_min = (now_ts - last_user) / 60.0
+        if idle_min >= GROUP_AMBIENT_IDLE_MIN and random.random() < GROUP_AMBIENT_PROB:
+            ctx = make_context_snippet(chat_id)
+            try_generate_and_send(chat_id, "ambient_group", "ambient_group", context=ctx)
+            mark_today(chat_id, "ambient_done", date_str)
+            return
+
+# ============================================================
+# Workers
+# ============================================================
 
 def process_interjection(chat_id: int):
     lock = chat_lock(chat_id)
@@ -729,22 +1291,8 @@ def process_interjection(chat_id: int):
         if not context:
             return
 
-        now_ts = int(time.time())
-        msgs = (
-            [{"role": "system", "content": SYSTEM_PROMPT}]
-            + FEW_SHOTS
-            + [
-                {"role": "system", "content":
-                 f"Текущее время (UTC unix): {now_ts}. Учитывай паузы между сообщениями. "
-                 "Ты в групповом чате. Вклиниваешься коротко (1-2 предложения). "
-                 "пиши как в переписке, чаще маленькими буквами. "
-                 "НЕ обращайся 'папа/мама'. НЕ пересказывай факты. НЕ объясняй что ты ИИ."},
-                {"role": "system", "content":
-                 "Если речь про даты/новости — скажи, что у тебя нет доступа к интернету в реальном времени."},
-                {"role": "user", "content": f"Контекст:\n{context}\n\nСкажи одну короткую реплику-вклин."}
-            ]
-        )
-
+        last_text = meta_get(f"proactive_last_text:{chat_id}", "").strip()
+        msgs = build_messages_mode(chat_id, "interject", context=context, last_proactive=last_text)
         text = llm_chat(msgs, max_tokens=140).strip()
         if not text:
             return
@@ -764,74 +1312,31 @@ def process_interjection(chat_id: int):
     finally:
         lock.release()
 
-# ============================================================
-# Idle proactive (quiet -> message)
-# ============================================================
-
-def idle_proactive_loop():
-    if not IDLE_PROACTIVE_ENABLED or not IDLE_CHAT_ID:
+def proactive_loop():
+    if not PROACTIVE_ENABLED:
+        log("Proactive engine disabled.")
         return
-    log("Idle proactive enabled for chat", IDLE_CHAT_ID)
+    log("Proactive engine enabled. TZ =", TZ_NAME)
 
     while True:
         try:
-            now = int(time.time())
-            last_user = int(meta_get(f"last_user_ts:{IDLE_CHAT_ID}", "0") or 0)
-            last_ping = int(meta_get(f"idle_last_ping:{IDLE_CHAT_ID}", "0") or 0)
+            # update summaries opportunistically
+            if SUMMARY_ENABLED:
+                for cid in list_known_chats(days=14):
+                    if can_update_summary_now(cid):
+                        update_summary(cid)
 
-            idle_sec = now - last_user if last_user else 0
-            cooldown_ok = (now - last_ping) >= (IDLE_COOLDOWN_MIN * 60)
-            idle_ok = last_user and idle_sec >= (IDLE_AFTER_MIN * 60)
+            # proactive pings
+            for cid in list_known_chats(days=14):
+                proactive_tick_for_chat(cid)
 
-            if idle_ok and cooldown_ok and random.random() < IDLE_PROB:
-                lock = chat_lock(IDLE_CHAT_ID)
-                if not lock.acquire(timeout=1.5):
-                    time.sleep(30)
-                    continue
-
-                try:
-                    hist = get_history(IDLE_CHAT_ID, 22)
-                    user_lines = [m["content"] for m in hist if m["role"] == "user"][-10:]
-                    context = "\n".join(user_lines).strip()
-
-                    msgs = (
-                        [{"role": "system", "content": SYSTEM_PROMPT}]
-                        + FEW_SHOTS
-                        + [
-                            {"role": "system", "content":
-                                "Ты в групповом чате. Тишина уже какое-то время. "
-                                "Напиши коротко (1-2 предложения) что-то живое: "
-                                "вопрос, наблюдение, лёгкий тейк про музыку/аниме. "
-                                "пиши как в переписке, чаще маленькими буквами. "
-                                "Не начинай с 'я ИИ'. Не говори 'папа/мама'."},
-                            {"role": "system", "content":
-                                "Если вопрос про даты/новости — честно скажи, что у тебя нет интернета в реальном времени."},
-                            {"role": "user", "content": f"Контекст:\n{context}\n\nСообщение для оживления чата:"}
-                        ]
-                    )
-
-                    text = llm_chat(msgs, max_tokens=140).strip()
-                    if text:
-                        text = soften_addressing(strip_memory_dump(text), allow_family=False)
-                        text = normalize_chat_reply(text)
-
-                        time.sleep(human_read_delay())
-                        typing_sleep(IDLE_CHAT_ID, calc_typing_seconds(text))
-                        send_message(IDLE_CHAT_ID, text, None)
-                        save_message(IDLE_CHAT_ID, "assistant", text, ts=int(time.time()))
-                        meta_set(f"idle_last_ping:{IDLE_CHAT_ID}", str(int(time.time())))
-
-                finally:
-                    lock.release()
-
-            time.sleep(30)
-
+            time.sleep(max(15, PROACTIVE_LOOP_SEC))
         except Exception as e:
-            log("idle loop error:", repr(e))
+            log("proactive loop error:", repr(e))
             time.sleep(60)
 
 # ============================================================
-# Main worker
+# Main worker (replies)
 # ============================================================
 
 def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_id: int):
@@ -846,15 +1351,38 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
     try:
         upsert_profile_from_tg(from_user)
 
+        # creator-only control commands (only when bot is invoked normally)
+        cmd = parse_control_cmd(text)
+        if cmd and user_id == CREATOR_USER_ID:
+            if cmd == "silent":
+                meta_set(f"proactive_enabled:{chat_id}", "0")
+                send_human(chat_id, "ок. я буду тише и перестану писать первой здесь.", reply_to_message_id,
+                           allow_split=False, allow_family=False)
+                return
+            if cmd == "wake":
+                meta_set(f"proactive_enabled:{chat_id}", "1")
+                send_human(chat_id, "ладно. могу иногда заходить сама, но без спама.", reply_to_message_id,
+                           allow_split=False, allow_family=False)
+                return
+            if cmd == "status":
+                ct = get_chat_type(chat_id) or "unknown"
+                en = proactive_enabled_for_chat(chat_id)
+                dt = now_msk()
+                ds = msk_date_str(dt)
+                cnt = get_daily_count(chat_id, ds)
+                cap = daily_cap_for_chat(chat_id)
+                msg = f"статус: chat_type={ct}, proactive={'on' if en else 'off'}, сегодня={cnt}/{cap}, время мск={msk_time_str(dt)}."
+                send_human(chat_id, msg, reply_to_message_id, allow_split=False, allow_family=False)
+                return
+
         # learn from user
         maybe_learn_display_name(user_id, text)
         learned_alias = maybe_learn_music_alias(user_id, text)
 
         prof = get_profile(user_id) or {}
         display_name = prof.get("display_name") or prof.get("tg_first_name") or None
-        relationship = prof.get("relationship") or None
-        music_alias = prof.get("music_alias") or None
 
+        relationship = prof.get("relationship") or None
         is_creator = (relationship == "creator")
         is_mother = (relationship == "mother")
         allow_family = is_creator or is_mother
@@ -865,74 +1393,21 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
                 reply = f"тебя зовут {display_name}."
             else:
                 reply = "я не уверена. скажи “меня зовут …”, и я запомню."
-            reply = normalize_chat_reply(reply)
-            time.sleep(human_read_delay())
-            typing_sleep(chat_id, calc_typing_seconds(reply))
-            send_message(chat_id, reply, reply_to_message_id)
-            save_message(chat_id, "assistant", reply, ts=int(time.time()))
+            send_human(chat_id, reply, reply_to_message_id, allow_split=False, allow_family=False)
             return
 
         if learned_alias:
             reply = f"ок. запомнила: твой музыкальный псевдоним — {learned_alias}."
-            reply = normalize_chat_reply(reply)
-            time.sleep(human_read_delay())
-            typing_sleep(chat_id, calc_typing_seconds(reply))
-            send_message(chat_id, reply, reply_to_message_id)
-            save_message(chat_id, "assistant", reply, ts=int(time.time()))
+            send_human(chat_id, reply, reply_to_message_id, allow_split=False, allow_family=False)
             return
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
-
-        # Card WITHOUT @username to avoid repeating handles
-        card = []
-        if display_name:
-            card.append(f"preferred_name={display_name}")
-        if music_alias:
-            card.append(f"music_alias={music_alias}")
-        if is_creator:
-            card.append(f"relationship=creator. можно иногда обращаться '{CREATOR_NICK}', но не обязана и не всегда.")
-        elif is_mother:
-            card.append(f"relationship=mother. можно иногда обращаться '{MOTHER_NICK}', но не обязана и не всегда.")
-        if card:
-            messages.append({"role": "system", "content": "Карточка собеседника (не пересказывай её в ответе):\n" + "\n".join(card)})
-
-        now_ts = int(time.time())
-        messages.append({"role": "system", "content": f"Текущее время (UTC unix): {now_ts}. Учитывай паузы и тайминг."})
-        messages.append({"role": "system", "content": "Правило точности: если вопрос про дату/новость/актуальную инфу — говори, что у тебя нет доступа к интернету в реальном времени, и не выдумывай."})
-
-        if needs_identity_answer(text):
-            messages.append({"role": "system", "content": "Если это вопрос 'кто ты/как тебя зовут/ты ИИ' — ответь кратко."})
-        else:
-            messages.append({"role": "system", "content": "Не представляйся и не повторяй, что ты ИИ, если тебя не спрашивали."})
-
-        messages += get_history(chat_id, HISTORY_LIMIT)
-
-        u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
-        if u_hist:
-            messages.append({"role": "system", "content": "Сообщения этого пользователя ранее (для контекста, не пересказывать):"})
-            messages += u_hist
-
+        messages, allow_family = build_messages_reply(chat_id, user_id, text)
         reply = llm_chat(messages)
+
         if not reply:
             reply = "не уловила. перефразируй одним предложением. (・_・;)"
 
-        reply = strip_memory_dump(reply)
-        reply = soften_addressing(reply, allow_family=allow_family)
-        reply = normalize_chat_reply(reply)
-
-        time.sleep(human_read_delay())
-        parts = split_reply(reply)
-
-        for idx, part in enumerate(parts):
-            part = strip_memory_dump(part)
-            part = soften_addressing(part, allow_family=allow_family)
-            part = normalize_chat_reply(part)
-
-            typing_sleep(chat_id, calc_typing_seconds(part))
-            send_message(chat_id, part, reply_to_message_id if idx == 0 else None)
-            save_message(chat_id, "assistant", part, ts=int(time.time()))
-            if idx < len(parts) - 1:
-                time.sleep(random.uniform(0.8, 2.2))
+        send_human(chat_id, reply, reply_to_message_id, allow_split=True, allow_family=allow_family)
 
     except Exception as e:
         log("process_message exception:", repr(e))
@@ -960,11 +1435,23 @@ def webhook():
 
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
+    chat_type = chat.get("type") or ""
+    chat_title = chat.get("title") or chat.get("username") or ""
+
     from_user = msg.get("from") or {}
     text = (msg.get("text") or "").strip()
     msg_ts = int(msg.get("date") or time.time())
 
-    log("webhook hit chat_id=", chat_id, "from_user_id=", from_user.get("id"), "text=", text[:120])
+    log("webhook hit chat_id=", chat_id, "type=", chat_type, "from_user_id=", from_user.get("id"), "text=", text[:120])
+
+    # store chat info
+    try:
+        if chat_id:
+            meta_set(f"chat_type:{chat_id}", str(chat_type))
+            if chat_title:
+                meta_set(f"chat_title:{chat_id}", str(chat_title)[:120])
+    except Exception:
+        pass
 
     # Always store stream (so Yui “listens”) with Telegram timestamp
     try:
@@ -972,9 +1459,9 @@ def webhook():
         if uid:
             upsert_profile_from_tg(from_user)
             save_message(chat_id, "user", text, ts=msg_ts)
-            # keep per-user tagged copy for user-specific retrieval
             save_message(chat_id, "user", f"[u:{uid}] {text}", ts=msg_ts)
             meta_set(f"last_user_ts:{chat_id}", str(msg_ts))
+            maybe_schedule_summary_update(chat_id, msg_ts)
     except Exception as e:
         log("save stream error:", repr(e))
 
@@ -1013,5 +1500,7 @@ seed_family_profiles()
 refresh_bot_id()
 set_webhook()
 
-if IDLE_PROACTIVE_ENABLED:
-    threading.Thread(target=idle_proactive_loop, daemon=True).start()
+# start proactive background loop
+if PROACTIVE_ENABLED:
+    threading.Thread(target=proactive_loop, daemon=True).start()
+```
