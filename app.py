@@ -18,7 +18,7 @@ from flask import Flask, request
 
 TG_TOKEN = os.getenv("TG_TOKEN")
 PUBLIC_URL = os.getenv("PUBLIC_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET", "super_yuii")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_yuii")
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -180,11 +180,9 @@ def normalize_chat_reply(text: str) -> str:
     if not t:
         return t
 
-    # keep acronyms like NEZ / AI / ИИ at the very start
     if _ACRONYM_RE.match(t):
         return t
 
-    # lower-case first alphabetic char (latin/cyrillic)
     for i, ch in enumerate(t):
         if ch.isalpha():
             if ch.isupper():
@@ -215,10 +213,8 @@ def hour_float(dt: datetime) -> float:
 
 def in_quiet_hours(dt: datetime) -> bool:
     h = hour_float(dt)
-    # handles wrap-around? here quiet is [start, end) with start < end by default
     if QUIET_HOURS_START < QUIET_HOURS_END:
         return QUIET_HOURS_START <= h < QUIET_HOURS_END
-    # wrap case (e.g., 23 -> 7)
     return h >= QUIET_HOURS_START or h < QUIET_HOURS_END
 
 def random_time_in_window(date_dt: datetime, start_h: float, end_h: float) -> datetime:
@@ -251,12 +247,16 @@ def init_db():
         conn = _db()
         cur = conn.cursor()
 
+        # A) messages now stores author info (user_id/user_name/msg_id)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 chat_id INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
-                ts INTEGER NOT NULL
+                ts INTEGER NOT NULL,
+                user_id INTEGER,
+                user_name TEXT,
+                msg_id INTEGER
             )
         """)
         ensure_columns(conn, "messages", {
@@ -264,6 +264,9 @@ def init_db():
             "role": "TEXT",
             "content": "TEXT",
             "ts": "INTEGER",
+            "user_id": "INTEGER",
+            "user_name": "TEXT",
+            "msg_id": "INTEGER",
         })
 
         cur.execute("""
@@ -328,31 +331,62 @@ def seed_family_profiles():
         conn.close()
     return db_safe(_do)
 
-def save_message(chat_id: int, role: str, content: str, ts: int | None = None):
+# B) save_message stores author info (optional)
+def save_message(
+    chat_id: int,
+    role: str,
+    content: str,
+    ts: int | None = None,
+    user_id: int | None = None,
+    user_name: str | None = None,
+    msg_id: int | None = None,
+):
     ts2 = int(ts) if ts is not None else int(time.time())
     def _do():
         conn = _db()
         conn.execute(
-            "INSERT INTO messages (chat_id, role, content, ts) VALUES (?, ?, ?, ?)",
-            (chat_id, role, content, ts2)
+            "INSERT INTO messages (chat_id, role, content, ts, user_id, user_name, msg_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, role, content, ts2, user_id, user_name, msg_id)
         )
         conn.commit()
         conn.close()
     return db_safe(_do)
 
+# D) get_history prefixes user messages with author in groups
 def get_history(chat_id: int, limit: int):
     """General chat history (EXCLUDES tagged duplicates like [u:123] ...)."""
+    chat_type = get_chat_type(chat_id) or ""
     def _do():
         conn = _db()
         rows = conn.execute(
-            "SELECT role, content FROM messages "
+            "SELECT role, content, user_id, user_name FROM messages "
             "WHERE chat_id=? AND content NOT LIKE '[u:%' "
             "ORDER BY ts DESC LIMIT ?",
             (chat_id, limit)
         ).fetchall()
         conn.close()
+
         rows2 = list(reversed(rows))
-        return [{"role": r["role"], "content": r["content"]} for r in rows2]
+        out: list[dict] = []
+        for r in rows2:
+            role = r["role"]
+            c = (r["content"] or "").strip()
+            if not c:
+                continue
+
+            if role == "user" and chat_type in ("group", "supergroup"):
+                nm = (r["user_name"] or "").strip()
+                uid = r["user_id"]
+                tag = nm if nm else (f"id{uid}" if uid else "user")
+                # keep it compact / single-line-ish
+                tag = re.sub(r"[\r\n\t]+", " ", tag).strip()
+                if len(tag) > 48:
+                    tag = tag[:48] + "…"
+                c = f"{tag}: {c}"
+
+            out.append({"role": role, "content": c})
+        return out
     return db_safe(_do)
 
 def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
@@ -629,7 +663,6 @@ def maybe_learn_music_alias(user_id: int, text: str) -> str | None:
                 return alias
     return None
 
-# Simple creator-only control commands
 def parse_control_cmd(text: str) -> str | None:
     t = (text or "").strip().lower()
     if t in ("/yui_silent", "юи тише", "юи молчи", "юи офф", "юи выключись"):
@@ -737,7 +770,6 @@ def is_reply_to_yui(msg: dict) -> bool:
     return BOT_ID is not None and frm.get("id") == BOT_ID
 
 def _mentions_this_bot(text: str, entities: list[dict]) -> bool:
-    """Return True only if message mentions @<this bot>."""
     if not BOT_USERNAME or not text or not entities:
         return False
     target = "@" + BOT_USERNAME.lower()
@@ -827,7 +859,6 @@ def should_interject(msg: dict) -> bool:
     if random.random() > INTERJECT_PROB:
         return False
 
-    # avoid interjecting in quiet hours unless it's clearly emotional (allow EMO triggers)
     dt = now_msk()
     if in_quiet_hours(dt) and not any(k in t for k in EMO_TRIGGERS):
         return False
@@ -866,7 +897,6 @@ def set_chat_summary(chat_id: int, summary: str):
     meta_set(f"chat_summary_updated_ts:{chat_id}", str(int(time.time())))
 
 def maybe_schedule_summary_update(chat_id: int, msg_ts: int):
-    """Mark dirty + store last message ts. Actual update runs in background."""
     if not SUMMARY_ENABLED:
         return
     meta_set(f"chat_summary_dirty:{chat_id}", "1")
@@ -885,14 +915,12 @@ def can_update_summary_now(chat_id: int) -> bool:
         return False
 
     base_ts = int(meta_get(f"chat_summary_base_ts:{chat_id}", "0") or 0)
-    # if base_ts missing, set to (now - 7 days) to avoid scanning ancient history
     if not base_ts:
         base_ts = now_ts - 7 * 86400
 
     n_new = count_new_user_msgs(chat_id, base_ts)
     if n_new >= SUMMARY_EVERY_N_USER_MSG:
         return True
-    # or if enough time passed and there is some new content
     if last_upd and (now_ts - last_upd) > 6 * 3600 and n_new >= 10:
         return True
 
@@ -914,7 +942,6 @@ def update_summary(chat_id: int):
             c = m["content"].strip()
             if not c:
                 continue
-            # Keep it compact
             if len(c) > 700:
                 c = c[:700] + "…"
             ctx_lines.append(f"{role}: {c}")
@@ -942,7 +969,6 @@ def update_summary(chat_id: int):
         if new_sum:
             set_chat_summary(chat_id, new_sum)
 
-        # advance base_ts to last message ts we saw
         last_msg_ts = int(meta_get(f"chat_summary_last_msg_ts:{chat_id}", "0") or 0)
         if last_msg_ts:
             meta_set(f"chat_summary_base_ts:{chat_id}", str(last_msg_ts))
@@ -987,6 +1013,7 @@ def add_time_system(messages: list[dict], *, extra: str = ""):
         "content": f"локальное время в москве: {msk_time_str(dt)} (msk), дата: {msk_date_str(dt)}. {extra}".strip()
     })
 
+# E+F) build_messages_reply: user_history becomes system memory (not user turns) + anchor rule
 def build_messages_reply(chat_id: int, user_id: int, text: str) -> tuple[list[dict], bool]:
     meta_user, allow_family = build_user_card(user_id)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
@@ -1008,10 +1035,31 @@ def build_messages_reply(chat_id: int, user_id: int, text: str) -> tuple[list[di
 
     messages += get_history(chat_id, HISTORY_LIMIT)
 
+    # user-specific memory as SYSTEM, not as extra "user" turns
     u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
     if u_hist:
-        messages.append({"role": "system", "content": "Сообщения этого пользователя ранее (для контекста, не пересказывать):"})
-        messages += u_hist
+        lines = []
+        for m in u_hist[-10:]:
+            c = (m.get("content") or "").strip()
+            if not c:
+                continue
+            if len(c) > 200:
+                c = c[:200] + "…"
+            lines.append("• " + c)
+        if lines:
+            messages.append({
+                "role": "system",
+                "content": "память о стиле/темах этого пользователя (не отвечай на эти строки отдельно, только для персонализации):\n"
+                           + "\n".join(lines)
+            })
+
+    # F) anchor: answer only the current user message
+    messages.append({
+        "role": "system",
+        "content": "важно: отвечай ТОЛЬКО на текущее сообщение пользователя. "
+                   "не продолжай старую тему, если её не упомянули сейчас. "
+                   "не отвечай на вопросы из памяти/истории, если их нет в текущей реплике."
+    })
 
     return messages, allow_family
 
@@ -1020,7 +1068,6 @@ def build_messages_mode(chat_id: int, mode: str, *, context: str = "", last_proa
     add_time_system(messages)
 
     if last_proactive:
-        # keep it short; do not quote too much
         lp = last_proactive.strip()
         if len(lp) > 220:
             lp = lp[:220] + "…"
@@ -1030,7 +1077,6 @@ def build_messages_mode(chat_id: int, mode: str, *, context: str = "", last_proa
     if summ:
         messages.append({"role": "system", "content": "Память чата (не пересказывай дословно):\n" + summ})
 
-    # mode-specific contract
     if mode == "interject":
         messages.append({"role": "system", "content":
             "Ты в групповом чате. Вклиниваешься коротко (1–2 предложения). "
@@ -1095,7 +1141,6 @@ def proactive_enabled_for_chat(chat_id: int) -> bool:
     v = meta_get(f"proactive_enabled:{chat_id}", "").strip()
     if v in ("0", "1"):
         return v == "1"
-    # default depends on chat type
     ct = get_chat_type(chat_id)
     if ct == "private":
         return PROACTIVE_DEFAULT_PRIVATE
@@ -1152,7 +1197,6 @@ def ensure_daily_plan(chat_id: int, kind: str, date_str: str, start_h: float, en
     if val:
         return val
 
-    # build local date based on MSK date_str
     dt0 = datetime.fromisoformat(date_str).replace(tzinfo=TZ)
     plan_dt = random_time_in_window(dt0, start_h, end_h)
     plan_epoch = int(plan_dt.timestamp())
@@ -1199,11 +1243,9 @@ def try_generate_and_send(chat_id: int, kind: str, mode: str, *, context: str):
         text = soften_addressing(text, allow_family=False)
         text = normalize_chat_reply(text)
 
-        # anti-repeat (exact hash)
         new_h = sha1_hex(text)
         old_h = meta_get(f"proactive_last_hash:{chat_id}", "")
         if old_h and new_h == old_h:
-            # one retry
             text2 = llm_chat(msgs, max_tokens=180).strip()
             if not text2:
                 return
@@ -1230,11 +1272,9 @@ def proactive_tick_for_chat(chat_id: int):
     dt = now_msk()
     date_str = msk_date_str(dt)
 
-    # no proactive in quiet hours
     if in_quiet_hours(dt):
         return
 
-    # hard caps
     if get_daily_count(chat_id, date_str) >= daily_cap_for_chat(chat_id):
         return
     if not cooldown_ok(chat_id):
@@ -1244,13 +1284,11 @@ def proactive_tick_for_chat(chat_id: int):
     last_user = get_last_user_ts(chat_id)
     now_ts = int(time.time())
 
-    # require some recent activity (avoid pinging dead chats forever)
     if not last_user:
         return
     if (now_ts - last_user) > 14 * 86400:
         return
 
-    # ---- morning plan
     morning_plan = ensure_daily_plan(chat_id, "morning", date_str, MORNING_START, MORNING_END)
     if now_ts >= morning_plan and not got_today(chat_id, "morning_done", date_str):
         p = MORNING_PROB_PRIVATE if ct == "private" else MORNING_PROB_GROUP
@@ -1260,7 +1298,6 @@ def proactive_tick_for_chat(chat_id: int):
         mark_today(chat_id, "morning_done", date_str)
         return
 
-    # ---- evening plan
     evening_plan = ensure_daily_plan(chat_id, "evening", date_str, EVENING_START, EVENING_END)
     if now_ts >= evening_plan and not got_today(chat_id, "evening_done", date_str):
         p = EVENING_PROB_PRIVATE if ct == "private" else EVENING_PROB_GROUP
@@ -1270,7 +1307,6 @@ def proactive_tick_for_chat(chat_id: int):
         mark_today(chat_id, "evening_done", date_str)
         return
 
-    # ---- private check-in (quiet 36–96h)
     if ct == "private" and not got_today(chat_id, "checkin_done", date_str):
         hours = (now_ts - last_user) / 3600.0
         if CHECKIN_MIN_H <= hours <= CHECKIN_MAX_H and random.random() < CHECKIN_PROB:
@@ -1279,7 +1315,6 @@ def proactive_tick_for_chat(chat_id: int):
             mark_today(chat_id, "checkin_done", date_str)
             return
 
-    # ---- group ambient ping (quiet long)
     if ct in ("group", "supergroup") and not got_today(chat_id, "ambient_done", date_str):
         idle_min = (now_ts - last_user) / 60.0
         if idle_min >= GROUP_AMBIENT_IDLE_MIN and random.random() < GROUP_AMBIENT_PROB:
@@ -1333,13 +1368,11 @@ def proactive_loop():
 
     while True:
         try:
-            # update summaries opportunistically
             if SUMMARY_ENABLED:
                 for cid in list_known_chats(days=14):
                     if can_update_summary_now(cid):
                         update_summary(cid)
 
-            # proactive pings
             for cid in list_known_chats(days=14):
                 proactive_tick_for_chat(cid)
 
@@ -1364,7 +1397,6 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
     try:
         upsert_profile_from_tg(from_user)
 
-        # creator-only control commands (only when bot is invoked normally)
         cmd = parse_control_cmd(text)
         if cmd and user_id == CREATOR_USER_ID:
             if cmd == "silent":
@@ -1388,7 +1420,6 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
                 send_human(chat_id, msg, reply_to_message_id, allow_split=False, allow_family=False)
                 return
 
-        # learn from user
         maybe_learn_display_name(user_id, text)
         learned_alias = maybe_learn_music_alias(user_id, text)
 
@@ -1400,7 +1431,6 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         is_mother = (relationship == "mother")
         allow_family = is_creator or is_mother
 
-        # Fast answers
         if asks_my_name(text):
             if display_name:
                 reply = f"тебя зовут {display_name}."
@@ -1457,7 +1487,6 @@ def webhook():
 
     log("webhook hit chat_id=", chat_id, "type=", chat_type, "from_user_id=", from_user.get("id"), "text=", text[:120])
 
-    # store chat info
     try:
         if chat_id:
             meta_set(f"chat_type:{chat_id}", str(chat_type))
@@ -1466,19 +1495,25 @@ def webhook():
     except Exception:
         pass
 
-    # Always store stream (so Yui “listens”) with Telegram timestamp
+    # C) store stream with author info (user_name + msg_id)
     try:
-        uid = from_user.get("id")
+        uid = (from_user or {}).get("id")
         if uid:
             upsert_profile_from_tg(from_user)
-            save_message(chat_id, "user", text, ts=msg_ts)
-            save_message(chat_id, "user", f"[u:{uid}] {text}", ts=msg_ts)
+
+            first = (from_user or {}).get("first_name") or ""
+            last = (from_user or {}).get("last_name") or ""
+            uname = (first + " " + last).strip() or ((from_user or {}).get("username") or "")
+            mid = int(msg.get("message_id") or 0) or None
+
+            save_message(chat_id, "user", text, ts=msg_ts, user_id=uid, user_name=uname, msg_id=mid)
+            save_message(chat_id, "user", f"[u:{uid}] {text}", ts=msg_ts, user_id=uid, user_name=uname, msg_id=mid)
+
             meta_set(f"last_user_ts:{chat_id}", str(msg_ts))
             maybe_schedule_summary_update(chat_id, msg_ts)
     except Exception as e:
         log("save stream error:", repr(e))
 
-    # Normal reply path
     if should_reply(msg):
         reply_to_message_id = msg.get("message_id")
         threading.Thread(
@@ -1488,7 +1523,6 @@ def webhook():
         ).start()
         return "ok"
 
-    # Smart interjection path
     if should_interject(msg):
         threading.Thread(target=process_interjection, args=(chat_id,), daemon=True).start()
 
@@ -1513,6 +1547,5 @@ seed_family_profiles()
 refresh_bot_id()
 set_webhook()
 
-# start proactive background loop
 if PROACTIVE_ENABLED:
     threading.Thread(target=proactive_loop, daemon=True).start()
