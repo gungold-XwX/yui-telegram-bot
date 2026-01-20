@@ -1,4 +1,3 @@
-```python
 # app.py
 import os
 import time
@@ -1503,4 +1502,3 @@ set_webhook()
 # start proactive background loop
 if PROACTIVE_ENABLED:
     threading.Thread(target=proactive_loop, daemon=True).start()
-```
