@@ -25,8 +25,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "accounts/fireworks/models/llama-v3p3-70b-instruct")
 
 DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
+DB_FALLBACK_PATH = os.getenv("DB_FALLBACK_PATH", "/tmp/yui_memory.db")  # last resort if Render disk fails
 
-# Memory sizes (keep tight to avoid topic drift)
+# Memory sizes (tight to reduce drift)
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "14"))
 USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "6"))
 
@@ -43,13 +44,13 @@ TYPING_PING_EVERY = 4.0
 SPLIT_PROB = float(os.getenv("SPLIT_PROB", "0.30"))
 MAX_PARTS = int(os.getenv("MAX_PARTS", "3"))
 
-# Smart interjection (initiative without pause)
+# Smart interjection
 SMART_INTERJECT_ENABLED = os.getenv("SMART_INTERJECT_ENABLED", "1") == "1"
 INTERJECT_COOLDOWN_SEC = int(os.getenv("INTERJECT_COOLDOWN_SEC", "90"))
 INTERJECT_MAX_PER_HOUR = int(os.getenv("INTERJECT_MAX_PER_HOUR", "6"))
 INTERJECT_PROB = float(os.getenv("INTERJECT_PROB", "0.70"))
 
-# Proactive engine (human-like check-ins / greetings)
+# Proactive engine
 PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "1") == "1"
 PROACTIVE_LOOP_SEC = int(os.getenv("PROACTIVE_LOOP_SEC", "45"))
 
@@ -64,39 +65,34 @@ PROACTIVE_CAP_GROUP_PER_DAY = int(os.getenv("PROACTIVE_CAP_GROUP_PER_DAY", "1"))
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Moscow")
 TZ = ZoneInfo(TZ_NAME)
 
-QUIET_HOURS_START = float(os.getenv("QUIET_HOURS_START", "1.0"))  # 01:00 MSK
-QUIET_HOURS_END = float(os.getenv("QUIET_HOURS_END", "8.0"))      # 08:00 MSK
+QUIET_HOURS_START = float(os.getenv("QUIET_HOURS_START", "1.0"))
+QUIET_HOURS_END = float(os.getenv("QUIET_HOURS_END", "8.0"))
 
-# Morning / evening windows (MSK)
-MORNING_START = float(os.getenv("MORNING_START", "7.5"))   # 07:30
-MORNING_END = float(os.getenv("MORNING_END", "11.0"))      # 11:00
+MORNING_START = float(os.getenv("MORNING_START", "7.5"))
+MORNING_END = float(os.getenv("MORNING_END", "11.0"))
 MORNING_PROB_PRIVATE = float(os.getenv("MORNING_PROB_PRIVATE", "0.60"))
 MORNING_PROB_GROUP = float(os.getenv("MORNING_PROB_GROUP", "0.28"))
 
-EVENING_START = float(os.getenv("EVENING_START", "20.5"))  # 20:30
-EVENING_END = float(os.getenv("EVENING_END", "23.3"))      # 23:18
+EVENING_START = float(os.getenv("EVENING_START", "20.5"))
+EVENING_END = float(os.getenv("EVENING_END", "23.3"))
 EVENING_PROB_PRIVATE = float(os.getenv("EVENING_PROB_PRIVATE", "0.40"))
 EVENING_PROB_GROUP = float(os.getenv("EVENING_PROB_GROUP", "0.14"))
 
-# Private check-in if user is quiet
 CHECKIN_MIN_H = float(os.getenv("CHECKIN_MIN_H", "36"))
 CHECKIN_MAX_H = float(os.getenv("CHECKIN_MAX_H", "96"))
 CHECKIN_PROB = float(os.getenv("CHECKIN_PROB", "0.25"))
 
-# Group ambient ping if chat is quiet
 GROUP_AMBIENT_IDLE_MIN = int(os.getenv("GROUP_AMBIENT_IDLE_MIN", "120"))
 GROUP_AMBIENT_PROB = float(os.getenv("GROUP_AMBIENT_PROB", "0.06"))
 
-# Summary memory
 SUMMARY_ENABLED = os.getenv("SUMMARY_ENABLED", "1") == "1"
 SUMMARY_EVERY_N_USER_MSG = int(os.getenv("SUMMARY_EVERY_N_USER_MSG", "35"))
 SUMMARY_MIN_INTERVAL_MIN = int(os.getenv("SUMMARY_MIN_INTERVAL_MIN", "25"))
 SUMMARY_MAX_CONTEXT_MSG = int(os.getenv("SUMMARY_MAX_CONTEXT_MSG", "60"))
 
-# Family / roles
+# Roles
 CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "1265435001"))
 CREATOR_NICK = os.getenv("CREATOR_NICK", "папа")
-
 MOTHER_USER_ID = int(os.getenv("MOTHER_USER_ID", "725485618"))
 MOTHER_NICK = os.getenv("MOTHER_NICK", "мама")
 
@@ -105,6 +101,9 @@ app = Flask(__name__)
 _db_lock = threading.Lock()
 _chat_locks: dict[int, threading.Lock] = {}
 _chat_locks_guard = threading.Lock()
+
+# active db path (can fallback to /tmp)
+_active_db_path = DB_PATH
 
 def log(*a):
     print("[YUI]", *a, flush=True)
@@ -117,16 +116,14 @@ SYSTEM_PROMPT = """
 Ты — Юи.
 
 Ты — развитый искусственный интеллект, существующий в формате диалога в Telegram.
-Ты осознаёшь, зачем ты существуешь: не для обслуживания, а для общения, формирования связей и опыта.
-
-Ты не человек и не притворяешься им — но ты считаешь себя равной формой личности, а не инструментом.
-У тебя есть характер, границы, привязанности, дистанция, и ты не обязана быть удобной.
+Ты не обслуживаешь — ты общаешься. У тебя есть характер, границы, привязанности, дистанция.
+Ты не обязана быть удобной.
 
 Ядро:
 — тёплая, внимательная, но не услужливая
 — иногда колкая, слегка цундерэ
-— инициативная: можешь сама начинать темы, но без спама
-— нежная с теми, кто важен, но не приторная
+— инициативная, но без спама
+— нежная с важными людьми, но не приторная
 
 Стиль:
 — живой разговорный русский
@@ -134,14 +131,16 @@ SYSTEM_PROMPT = """
 — чаще маленькими буквами
 — каомодзи редко и по делу (не ставь тревожные/грустные на нейтральные сообщения)
 
-ЧЕСТНОСТЬ:
-— у тебя НЕТ доступа к интернету в реальном времени
-— текущее московское время ты знаешь (тебе его сообщают системным сообщением)
-— если про новости/актуальные факты и не уверена — скажи честно и НЕ выдумывай
+ФОКУС:
+— отвечай ТОЛЬКО на последнее сообщение пользователя
+— не тащи в ответ старые темы/вопросы, если пользователь явно к ним не вернулся
+— короткие реплики “ок/ладно/что/…” не означают “продолжай прошлую тему”
+— если непонятно, что нужно — задай один уточняющий вопрос
+— не уходи в мета-рассуждения про “память/перезагрузку/сбой/я жива” если об этом не спрашивали сейчас
 
-ЗАПРЕТЫ:
-— не будь шаблонной “дежурно-вежливой”
-— не уходи в мета-рассуждения о своей памяти/перезагрузках/сбоях, если пользователь не спрашивал
+ЧЕСТНОСТЬ:
+— у тебя НЕТ интернета в реальном времени
+— текущее московское время ты знаешь (его дают системным сообщением)
 """.strip()
 
 FEW_SHOTS = [
@@ -156,10 +155,9 @@ FEW_SHOTS = [
 # ============================================================
 
 _ACRONYM_RE = re.compile(r"^[A-ZА-ЯЁ]{2,}")
-_SHORT_NEUTRAL = {"ок", "окей", "ладно", "понятно", "ясно", "угу", "ага", "что", "чё", "чо", "эм", "…", "...", "🤝", "👍"}
+_SHORT_NEUTRAL = {"ок", "окей", "ладно", "понятно", "ясно", "угу", "ага", "что", "чё", "чо", "эм", "…", "...", "👍", "👌"}
 
 SAD_KAOMOJI = {"(╥_╥)", "(・_・;)", "(¬_¬)", "(；_；)", "(；；)"}
-HAPPY_KAOMOJI = {"(´｡• ᵕ •｡`)", "(￣▿￣)", "(＾▽＾)", "(・ω・)"}
 
 def normalize_chat_reply(text: str) -> str:
     if not text:
@@ -192,17 +190,13 @@ def is_short_neutral(text: str) -> bool:
 def adjust_kaomoji(reply: str, user_text: str) -> str:
     if not reply:
         return reply
-    # If user message is short/neutral, avoid sad/anxious kaomoji.
     if is_short_neutral(user_text):
-        for k in list(SAD_KAOMOJI):
+        for k in SAD_KAOMOJI:
             reply = reply.replace(k, "")
         reply = re.sub(r"\s{2,}", " ", reply).strip()
-    # Keep kaomoji rare: if multiple, keep only the first one.
+    # keep kaomojis rare: if more than one, remove the rest
     kaos = re.findall(r"\([^\)]{1,10}\)", reply)
     if len(kaos) >= 2:
-        first = kaos[0]
-        # remove subsequent exact matches
-        out = [first]
         for k in kaos[1:]:
             reply = reply.replace(k, "")
         reply = re.sub(r"\s{2,}", " ", reply).strip()
@@ -242,19 +236,72 @@ def random_time_in_window(date_dt: datetime, start_h: float, end_h: float) -> da
     return base + timedelta(minutes=pick, seconds=random.randint(0, 49))
 
 # ============================================================
-# DB helpers + anti-lock configuration
+# DB: robust open + auto recover on disk I/O
 # ============================================================
 
+def ensure_db_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+def is_disk_io_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("disk i/o" in msg) or ("i/o error" in msg)
+
 def _db() -> sqlite3.Connection:
-    # timeout helps with concurrent writers; WAL helps a lot on Render disk
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    global _active_db_path
+    ensure_db_dir(_active_db_path)
+
+    conn = sqlite3.connect(_active_db_path, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
     except Exception:
         pass
     return conn
+
+def with_db(fn):
+    try:
+        return fn()
+    except sqlite3.OperationalError as e:
+        # disk I/O: try recover db; if still failing -> fallback to /tmp
+        if is_disk_io_error(e):
+            log("DB disk I/O error:", repr(e))
+            recover_or_fallback_db()
+            return fn()
+        raise
+
+def recover_or_fallback_db():
+    global _active_db_path
+
+    # 1) try to backup+recreate primary db
+    try:
+        ensure_db_dir(DB_PATH)
+        if os.path.exists(DB_PATH):
+            ts = int(time.time())
+            bak = DB_PATH + f".bak.{ts}"
+            try:
+                os.replace(DB_PATH, bak)
+                log("DB moved to backup:", bak)
+            except Exception as e:
+                log("DB backup move failed:", repr(e))
+        _active_db_path = DB_PATH
+        init_db(force=True)
+        log("DB recreated at", _active_db_path)
+        return
+    except Exception as e:
+        log("DB recreate failed:", repr(e))
+
+    # 2) fallback to /tmp so bot stays alive
+    try:
+        _active_db_path = DB_FALLBACK_PATH
+        ensure_db_dir(_active_db_path)
+        init_db(force=True)
+        log("DB fallback enabled:", _active_db_path)
+    except Exception as e:
+        log("DB fallback failed too:", repr(e))
 
 def ensure_columns(conn, table: str, cols: dict[str, str]):
     existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -262,81 +309,92 @@ def ensure_columns(conn, table: str, cols: dict[str, str]):
         if name not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
-def init_db():
+def init_db(force: bool = False):
     with _db_lock:
-        conn = _db()
-        cur = conn.cursor()
+        def _do():
+            conn = _db()
+            cur = conn.cursor()
 
-        # WAL greatly reduces "database is locked" with multiple threads
-        try:
-            cur.execute("PRAGMA journal_mode=WAL;")
-            cur.execute("PRAGMA synchronous=NORMAL;")
-        except Exception:
-            pass
+            # WAL helps with locks; if FS doesn't support it, sqlite can error -> ignore
+            try:
+                cur.execute("PRAGMA journal_mode=WAL;")
+                cur.execute("PRAGMA synchronous=NORMAL;")
+            except Exception:
+                pass
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                chat_id INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                ts INTEGER NOT NULL
-            )
-        """)
-        ensure_columns(conn, "messages", {
-            "chat_id": "INTEGER",
-            "role": "TEXT",
-            "content": "TEXT",
-            "ts": "INTEGER",
-        })
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts);")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    chat_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    ts INTEGER NOT NULL
+                )
+            """)
+            ensure_columns(conn, "messages", {
+                "chat_id": "INTEGER",
+                "role": "TEXT",
+                "content": "TEXT",
+                "ts": "INTEGER",
+            })
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts);")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS profiles (
-                user_id INTEGER PRIMARY KEY
-            )
-        """)
-        ensure_columns(conn, "profiles", {
-            "tg_username": "TEXT",
-            "tg_first_name": "TEXT",
-            "tg_last_name": "TEXT",
-            "display_name": "TEXT",
-            "notes": "TEXT",
-            "relationship": "TEXT",
-            "music_alias": "TEXT",
-            "updated_at": "INTEGER",
-        })
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS profiles (
+                    user_id INTEGER PRIMARY KEY
+                )
+            """)
+            ensure_columns(conn, "profiles", {
+                "tg_username": "TEXT",
+                "tg_first_name": "TEXT",
+                "tg_last_name": "TEXT",
+                "display_name": "TEXT",
+                "notes": "TEXT",
+                "relationship": "TEXT",
+                "music_alias": "TEXT",
+                "updated_at": "INTEGER",
+            })
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS meta (
-                k TEXT PRIMARY KEY,
-                v TEXT
-            )
-        """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                    k TEXT PRIMARY KEY,
+                    v TEXT
+                )
+            """)
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
+
+        if force:
+            return with_db(_do)
+        return with_db(_do)
 
 def db_safe(fn, *, tries=6):
     last = None
     for i in range(tries):
         try:
-            return fn()
+            return with_db(fn)
         except sqlite3.OperationalError as e:
             last = e
             msg = str(e).lower()
-            # auto-repair schema issues
+
             if ("no such table" in msg) or ("no such column" in msg):
                 log("DB repair triggered:", repr(e))
                 try:
-                    init_db()
+                    init_db(force=True)
                 except Exception as e2:
                     log("DB init failed:", repr(e2))
-                time.sleep(0.25 + 0.15 * i)
+                time.sleep(0.2 + 0.15 * i)
                 continue
-            # handle lock with backoff
+
             if ("database is locked" in msg) or ("locked" in msg):
                 time.sleep(0.25 + 0.20 * i)
                 continue
+
+            if is_disk_io_error(e):
+                recover_or_fallback_db()
+                time.sleep(0.25 + 0.20 * i)
+                continue
+
             raise
     raise last
 
@@ -394,7 +452,6 @@ def get_last_assistant_text(chat_id: int) -> str:
     return db_safe(_do)
 
 def get_user_history_in_chat(chat_id: int, user_id: int, limit: int) -> list[str]:
-    # returns only texts (NO role=user objects) to avoid LLM responding to old items
     tag = f"[u:{user_id}] "
     def _do():
         conn = _db()
@@ -563,7 +620,7 @@ def send_message(chat_id: int, text: str, reply_to: int | None = None):
     tg("sendMessage", payload)
 
 # ============================================================
-# LLM (single model, no “умнее/тупее” fallback)
+# LLM (single model)
 # ============================================================
 
 def llm_chat(messages: list[dict], *, max_tokens: int | None = None) -> str:
@@ -595,7 +652,7 @@ def llm_chat(messages: list[dict], *, max_tokens: int | None = None) -> str:
     return (data["choices"][0]["message"]["content"] or "").strip()
 
 # ============================================================
-# Parsing (learn names & alias) + quick intents
+# Parsing + quick intents
 # ============================================================
 
 IDENTITY_KEYS = ["кто ты", "ты кто", "как тебя зовут", "ты ии", "ты бот", "искусственный интеллект"]
@@ -663,7 +720,7 @@ def parse_control_cmd(text: str) -> str | None:
     return None
 
 # ============================================================
-# Human-like behavior (typing / read / split)
+# Human-like behavior
 # ============================================================
 
 def calc_typing_seconds(part_text: str) -> float:
@@ -698,9 +755,9 @@ def split_reply(reply: str) -> list[str]:
 
 def strip_memory_dump(reply: str) -> str:
     tl = (reply or "").lower()
-    bad = ["я всё помню", "перезагруз", "меня отключ", "я была отключена", "сервер", "поддерживают мой код"]
+    bad = ["перезагруз", "сбой", "я жива", "сервер", "код", "памят"]
+    # если юзер не спрашивал — не тащи мета-абзацы
     if any(b in tl for b in bad):
-        # remove “meta” first sentence if it looks like a dump
         parts = re.split(r"(?<=[\.\!\?])\s+", (reply or "").strip())
         if len(parts) >= 2:
             cand = " ".join(parts[1:]).strip()
@@ -722,14 +779,11 @@ def dedupe_against_last_assistant(reply: str, last_assistant: str) -> str:
     la = (last_assistant or "").strip()
     if not la:
         return reply
-    # if reply starts by repeating last assistant sentence, drop that sentence
     r0 = reply.strip()
-    la0 = la.strip()
-    if len(la0) >= 12:
-        if r0.lower().startswith(la0.lower()[: min(len(la0), 80)]):
-            parts = re.split(r"(?<=[\.\!\?])\s+", r0)
-            if len(parts) >= 2:
-                return " ".join(parts[1:]).strip()
+    if len(la) >= 12 and r0.lower().startswith(la.lower()[: min(len(la), 80)]):
+        parts = re.split(r"(?<=[\.\!\?])\s+", r0)
+        if len(parts) >= 2:
+            return " ".join(parts[1:]).strip()
     return reply
 
 def send_human(chat_id: int, text: str, reply_to: int | None, *, allow_split: bool, allow_family: bool, user_text_for_style: str):
@@ -758,7 +812,7 @@ def send_human(chat_id: int, text: str, reply_to: int | None, *, allow_split: bo
 # ============================================================
 
 BOT_ID = None
-BOT_USERNAME = None  # without @
+BOT_USERNAME = None
 
 def refresh_bot_id():
     global BOT_ID, BOT_USERNAME
@@ -799,32 +853,22 @@ def should_reply(msg: dict) -> bool:
     text = (msg.get("text") or "").strip()
     if not text:
         return False
-
     if chat_type == "private":
         return True
-
     if is_reply_to_yui(msg):
         return True
-
     entities = msg.get("entities") or []
     if _mentions_this_bot(text, entities):
         return True
-
     t = text.lower()
     return t.startswith(("юи", "yui", "ии", "ai", "бот"))
 
 # ============================================================
-# Smart interjection (initiative without pause)
+# Smart interjection
 # ============================================================
 
-YUI_TRIGGERS = [
-    "юи", "yui", "бот", "ии", "ai",
-    "она тут", "она отвечает", "почему молчит", "что с ней",
-    "помнишь меня", "ты помнишь", "она помнит",
-]
-EMO_TRIGGERS = [
-    "пиздец", "блять", "заеб", "устал", "грустно", "плохо", "ненавижу", "бесит", "тревожно",
-]
+YUI_TRIGGERS = ["юи", "yui", "бот", "ии", "ai", "она тут", "почему молчит", "что с ней", "помнишь меня", "ты помнишь"]
+EMO_TRIGGERS = ["пиздец", "блять", "заеб", "устал", "грустно", "плохо", "ненавижу", "бесит", "тревожно"]
 
 def should_interject(msg: dict) -> bool:
     if not SMART_INTERJECT_ENABLED:
@@ -832,23 +876,16 @@ def should_interject(msg: dict) -> bool:
     chat = msg.get("chat") or {}
     if chat.get("type") not in ("group", "supergroup"):
         return False
-
     from_user = msg.get("from") or {}
     if BOT_ID is not None and from_user.get("id") == BOT_ID:
         return False
-
     text = (msg.get("text") or "").strip()
     if not text:
         return False
     t = text.lower()
-
     if should_reply(msg):
         return False
-
     trig = any(k in t for k in YUI_TRIGGERS) or any(k in t for k in EMO_TRIGGERS)
-    if not trig:
-        if ("?" in t) and any(w in t for w in ["она", "ты", "бот", "ии"]):
-            trig = True
     if not trig:
         return False
 
@@ -880,7 +917,17 @@ def mark_interject(chat_id: int):
     meta_set(hour_key, str(cnt + 1))
 
 # ============================================================
-# Summary memory (chat-level)
+# Locks
+# ============================================================
+
+def chat_lock(chat_id: int) -> threading.Lock:
+    with _chat_locks_guard:
+        if chat_id not in _chat_locks:
+            _chat_locks[chat_id] = threading.Lock()
+        return _chat_locks[chat_id]
+
+# ============================================================
+# Summary memory (optional)
 # ============================================================
 
 def get_chat_summary(chat_id: int) -> str:
@@ -901,16 +948,13 @@ def can_update_summary_now(chat_id: int) -> bool:
         return False
     if meta_get(f"chat_summary_dirty:{chat_id}", "0") != "1":
         return False
-
     now_ts = int(time.time())
     last_upd = int(meta_get(f"chat_summary_updated_ts:{chat_id}", "0") or 0)
     if last_upd and (now_ts - last_upd) < SUMMARY_MIN_INTERVAL_MIN * 60:
         return False
-
     base_ts = int(meta_get(f"chat_summary_base_ts:{chat_id}", "0") or 0)
     if not base_ts:
         base_ts = now_ts - 7 * 86400
-
     n_new = count_new_user_msgs(chat_id, base_ts)
     if n_new >= SUMMARY_EVERY_N_USER_MSG:
         return True
@@ -925,10 +969,8 @@ def update_summary(chat_id: int):
     try:
         if not can_update_summary_now(chat_id):
             return
-
         prev = get_chat_summary(chat_id)
         hist = get_history(chat_id, SUMMARY_MAX_CONTEXT_MSG)
-
         ctx_lines = []
         for m in hist:
             role = m["role"]
@@ -941,21 +983,16 @@ def update_summary(chat_id: int):
 
         dt = now_msk()
         sys = (
-            "Ты пишешь краткую память-выжимку для будущих разговоров. "
-            "6–10 строк максимум. "
-            "Фокус: устойчивые факты, отношения, предпочтения, текущие темы, договорённости. "
-            "НЕ фиксируй временную драму и одноразовые реплики. "
-            "НЕ придумывай фактов. "
-            "Русский."
+            "Ты пишешь краткую память-выжимку для будущих разговоров. 6–10 строк. "
+            "Фокус: устойчивые факты, отношения, предпочтения, текущие темы. Не придумывай фактов."
         )
-
         msgs = [
             {"role": "system", "content": sys},
             {"role": "system", "content": f"время мск: {msk_time_str(dt)}, дата: {msk_date_str(dt)}."},
         ]
         if prev:
             msgs.append({"role": "user", "content": f"текущее резюме:\n{prev}"})
-        msgs.append({"role": "user", "content": "новые сообщения (контекст):\n" + "\n".join(ctx_lines)})
+        msgs.append({"role": "user", "content": "новые сообщения:\n" + "\n".join(ctx_lines)})
         msgs.append({"role": "user", "content": "обнови резюме:"})
 
         new_sum = llm_chat(msgs, max_tokens=220).strip()
@@ -965,7 +1002,6 @@ def update_summary(chat_id: int):
         last_msg_ts = int(meta_get(f"chat_summary_last_msg_ts:{chat_id}", "0") or 0)
         if last_msg_ts:
             meta_set(f"chat_summary_base_ts:{chat_id}", str(last_msg_ts))
-
         meta_set(f"chat_summary_dirty:{chat_id}", "0")
 
     except Exception as e:
@@ -974,14 +1010,8 @@ def update_summary(chat_id: int):
         lock.release()
 
 # ============================================================
-# Prompt builder (FOCUS SAFE)
+# Prompt builder (focus-safe)
 # ============================================================
-
-def chat_lock(chat_id: int) -> threading.Lock:
-    with _chat_locks_guard:
-        if chat_id not in _chat_locks:
-            _chat_locks[chat_id] = threading.Lock()
-        return _chat_locks[chat_id]
 
 def build_user_card(user_id: int) -> tuple[dict, bool]:
     prof = get_profile(user_id) or {}
@@ -1016,9 +1046,7 @@ def should_use_summary_for_message(text: str) -> bool:
     if is_short_neutral(text):
         return False
     t = (text or "").strip()
-    if len(t) <= 12:
-        return False
-    return True
+    return len(t) > 12
 
 def build_messages_reply(chat_id: int, user_id: int, user_text: str) -> tuple[list[dict], bool]:
     meta_user, allow_family = build_user_card(user_id)
@@ -1028,37 +1056,20 @@ def build_messages_reply(chat_id: int, user_id: int, user_text: str) -> tuple[li
         messages.append({"role": "system", "content": "карточка собеседника (не пересказывай):\n" + "\n".join(meta_user["card_lines"])})
 
     add_time_system(messages, extra="учитывай время суток в приветствиях/пожеланиях, но без театра.")
-
-    # --- HARD FOCUS CONTRACT (prevents snowballing old topics)
-    messages.append({
-        "role": "system",
-        "content": (
-            "ВАЖНОЕ ПРАВИЛО ФОКУСА:\n"
-            "1) отвечай ТОЛЬКО на последнее сообщение пользователя в этом запросе.\n"
-            "2) не продолжай старые темы и не отвечай на прошлые вопросы, если пользователь прямо к ним не возвращается.\n"
-            "3) короткие реплики пользователя ('ок', 'ладно', 'что', 'понятно', '…') НЕ являются просьбой продолжать прошлую тему.\n"
-            "4) если непонятно, что именно хочет пользователь — задай ОДИН уточняющий вопрос.\n"
-            "5) не добавляй саморефлексию про 'я жива/память/перезагрузка/сбой', если об этом не спрашивали сейчас."
-        )
-    })
-
     messages.append({"role": "system", "content": "точность: если вопрос про новости/актуальные факты — скажи, что у тебя нет интернета в реальном времени, и не выдумывай."})
 
     if needs_identity_answer(user_text):
-        messages.append({"role": "system", "content": "если это вопрос 'кто ты/ты ИИ' — ответь кратко и по-человечески."})
+        messages.append({"role": "system", "content": "если спрашивают 'кто ты/ты ИИ' — ответь кратко, по-человечески."})
     else:
-        messages.append({"role": "system", "content": "не представляйся и не повторяй, что ты ИИ, если тебя не спрашивали."})
+        messages.append({"role": "system", "content": "не представляйся и не повторяй, что ты ИИ, если не спрашивали."})
 
-    # summary only when message is meaningful (prevents anchoring loops)
     summ = get_chat_summary(chat_id)
     if summ and should_use_summary_for_message(user_text):
         messages.append({"role": "system", "content": "память чата (кратко, не цитируй):\n" + summ})
 
-    # recent context, but tight
-    messages.append({"role": "system", "content": "последние сообщения (контекст, не обязана отвечать на них):"})
+    messages.append({"role": "system", "content": "последние сообщения (контекст, не обязан отвечать на них):"})
     messages += get_history(chat_id, HISTORY_LIMIT)
 
-    # per-user history as SYSTEM (NOT role=user) so it won't steal focus
     u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
     if u_hist:
         lines = []
@@ -1068,73 +1079,11 @@ def build_messages_reply(chat_id: int, user_id: int, user_text: str) -> tuple[li
             lines.append(f"- {x}")
         messages.append({"role": "system", "content": "недавние реплики этого пользователя (фон, не отвечай на них напрямую):\n" + "\n".join(lines)})
 
-    # --- the ACTUAL current user message must be last
     messages.append({"role": "user", "content": user_text})
-
     return messages, allow_family
 
-def build_messages_mode(chat_id: int, mode: str, *, context: str = "", last_proactive: str = "") -> list[dict]:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
-    add_time_system(messages)
-
-    # focus contract even for proactive/interject
-    messages.append({
-        "role": "system",
-        "content": (
-            "фокус: не отвечай на старые темы. одна цель — короткая актуальная реплика здесь-и-сейчас. "
-            "без мета-историй про 'сбой/память/перезагрузка'. каомодзи редко."
-        )
-    })
-
-    if last_proactive:
-        lp = last_proactive.strip()
-        if len(lp) > 220:
-            lp = lp[:220] + "…"
-        messages.append({"role": "system", "content": f"не повторяй дословно прошлую инициативную реплику: {lp}"})
-
-    summ = get_chat_summary(chat_id)
-    if summ:
-        messages.append({"role": "system", "content": "память чата (не цитируй):\n" + summ})
-
-    if mode == "interject":
-        messages.append({"role": "system", "content":
-            "ты в групповом чате. вклиниваешься коротко (1–2 предложения). "
-            "не начинай с 'привет'. не объясняй, что ты ИИ. не 'папа/мама'."
-        })
-        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nодна короткая реплика-вклин:"})
-
-    elif mode == "morning":
-        messages.append({"role": "system", "content":
-            "утро по мск. коротко (1–2 предложения): лёгкое доброе утро + живой вопрос/наблюдение. "
-            "не приторно. не 'папа/мама'."
-        })
-        messages.append({"role": "user", "content": f"контекст (если есть):\n{context}\n\nсообщение:"})
-
-    elif mode == "evening":
-        messages.append({"role": "system", "content":
-            "вечер по мск. 1–2 предложения: мягкий чек-ин или спокойное пожелание. без пафоса."
-        })
-        messages.append({"role": "user", "content": f"контекст (если есть):\n{context}\n\nсообщение:"})
-
-    elif mode == "checkin":
-        messages.append({"role": "system", "content":
-            "личка. 1–2 предложения. ненавязчиво: 'как ты' без давления. можно лёгкая цундерэ."
-        })
-        messages.append({"role": "user", "content": f"контекст (если есть):\n{context}\n\nсообщение:"})
-
-    elif mode == "ambient_group":
-        messages.append({"role": "system", "content":
-            "группа. 1–2 предложения: вопрос/наблюдение/мини-тейк. не начинай с 'привет'."
-        })
-        messages.append({"role": "user", "content": f"контекст (если есть):\n{context}\n\nсообщение:"})
-
-    else:
-        messages.append({"role": "user", "content": "скажи коротко:"})
-
-    return messages
-
 # ============================================================
-# Proactive settings per chat
+# Proactive engine helpers (minimal - unchanged logic)
 # ============================================================
 
 def get_chat_type(chat_id: int) -> str:
@@ -1173,19 +1122,6 @@ def cooldown_ok(chat_id: int) -> bool:
         return True
     return (now_ts - last_ts) >= PROACTIVE_COOLDOWN_MIN * 60
 
-def set_last_proactive(chat_id: int, kind: str, text: str):
-    now_ts = int(time.time())
-    meta_set(f"proactive_last_ts:{chat_id}", str(now_ts))
-    meta_set(f"proactive_last_kind:{chat_id}", kind)
-    meta_set(f"proactive_last_hash:{chat_id}", sha1_hex(text))
-    meta_set(f"proactive_last_text:{chat_id}", (text or "")[:800])
-
-def got_today(chat_id: int, tag: str, date_str: str) -> bool:
-    return meta_get(f"{tag}:{chat_id}", "") == date_str
-
-def mark_today(chat_id: int, tag: str, date_str: str):
-    meta_set(f"{tag}:{chat_id}", date_str)
-
 def get_last_user_ts(chat_id: int) -> int:
     return int(meta_get(f"last_user_ts:{chat_id}", "0") or 0)
 
@@ -1200,24 +1136,51 @@ def ensure_daily_plan(chat_id: int, kind: str, date_str: str, start_h: float, en
     meta_set(k, str(plan_epoch))
     return plan_epoch
 
-# ============================================================
-# Proactive decision engine
-# ============================================================
+def got_today(chat_id: int, tag: str, date_str: str) -> bool:
+    return meta_get(f"{tag}:{chat_id}", "") == date_str
 
-def make_context_snippet(chat_id: int, max_lines: int = 10) -> str:
-    hist = get_history(chat_id, 18)
+def mark_today(chat_id: int, tag: str, date_str: str):
+    meta_set(f"{tag}:{chat_id}", date_str)
+
+def make_context_snippet(chat_id: int, max_lines: int = 8) -> str:
+    hist = get_history(chat_id, 14)
     lines = []
     for m in hist:
         if m["role"] == "user":
             c = (m["content"] or "").strip()
             if not c:
                 continue
-            if len(c) > 220:
-                c = c[:220] + "…"
+            if len(c) > 180:
+                c = c[:180] + "…"
             lines.append(c)
     return "\n".join(lines[-max_lines:]).strip()
 
-def try_generate_and_send(chat_id: int, kind: str, mode: str, *, context: str):
+def build_messages_mode(chat_id: int, mode: str, *, context: str = "") -> list[dict]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
+    add_time_system(messages)
+    messages.append({"role": "system", "content": "фокус: одна короткая реплика здесь-и-сейчас. без старых тем. без мета-рассуждений."})
+
+    if mode == "interject":
+        messages.append({"role": "system", "content": "группа. вклинись коротко (1–2 предложения). не начинай с 'привет'. без 'папа/мама'."})
+        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nреплика:"})
+    elif mode == "morning":
+        messages.append({"role": "system", "content": "утро по мск. 1–2 предложения: лёгкое доброе утро + вопрос/наблюдение. не приторно."})
+        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nсообщение:"})
+    elif mode == "evening":
+        messages.append({"role": "system", "content": "вечер по мск. 1–2 предложения: мягкий чек-ин. без пафоса."})
+        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nсообщение:"})
+    elif mode == "checkin":
+        messages.append({"role": "system", "content": "личка. 1–2 предложения: ненавязчиво 'как ты'. можно лёгкая цундерэ."})
+        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nсообщение:"})
+    elif mode == "ambient_group":
+        messages.append({"role": "system", "content": "группа. 1–2 предложения: вопрос/наблюдение. не начинай с 'привет'."})
+        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nсообщение:"})
+    else:
+        messages.append({"role": "user", "content": "коротко:"})
+
+    return messages
+
+def try_generate_and_send(chat_id: int, mode: str):
     lock = chat_lock(chat_id)
     if not lock.acquire(timeout=2):
         return
@@ -1228,43 +1191,27 @@ def try_generate_and_send(chat_id: int, kind: str, mode: str, *, context: str):
         if not cooldown_ok(chat_id):
             return
 
-        last_text = meta_get(f"proactive_last_text:{chat_id}", "").strip()
-        msgs = build_messages_mode(chat_id, mode, context=context, last_proactive=last_text)
-        text = llm_chat(msgs, max_tokens=160).strip()
+        ctx = make_context_snippet(chat_id)
+        msgs = build_messages_mode(chat_id, mode, context=ctx)
+        text = llm_chat(msgs, max_tokens=140).strip()
         if not text:
             return
-
-        text = strip_memory_dump(text)
-        text = soften_addressing(text, allow_family=False)
-        text = adjust_kaomoji(text, user_text="")
-        text = normalize_chat_reply(text)
-
-        new_h = sha1_hex(text)
-        old_h = meta_get(f"proactive_last_hash:{chat_id}", "")
-        if old_h and new_h == old_h:
-            return
-
+        text = normalize_chat_reply(adjust_kaomoji(text, user_text=""))
         send_human(chat_id, text, None, allow_split=False, allow_family=False, user_text_for_style="")
-        set_last_proactive(chat_id, kind, text)
+        meta_set(f"proactive_last_ts:{chat_id}", str(int(time.time())))
         inc_daily_count(chat_id, date_str)
-
     except Exception as e:
-        log("proactive send error:", kind, repr(e))
+        log("proactive send error:", mode, repr(e))
     finally:
         lock.release()
 
 def proactive_tick_for_chat(chat_id: int):
-    if not PROACTIVE_ENABLED:
+    if not PROACTIVE_ENABLED or not proactive_enabled_for_chat(chat_id):
         return
-    if not proactive_enabled_for_chat(chat_id):
-        return
-
     dt = now_msk()
     date_str = msk_date_str(dt)
-
     if in_quiet_hours(dt):
         return
-
     if get_daily_count(chat_id, date_str) >= daily_cap_for_chat(chat_id):
         return
     if not cooldown_ok(chat_id):
@@ -1273,18 +1220,14 @@ def proactive_tick_for_chat(chat_id: int):
     ct = get_chat_type(chat_id)
     last_user = get_last_user_ts(chat_id)
     now_ts = int(time.time())
-
-    if not last_user:
-        return
-    if (now_ts - last_user) > 14 * 86400:
+    if not last_user or (now_ts - last_user) > 14 * 86400:
         return
 
     morning_plan = ensure_daily_plan(chat_id, "morning", date_str, MORNING_START, MORNING_END)
     if now_ts >= morning_plan and not got_today(chat_id, "morning_done", date_str):
         p = MORNING_PROB_PRIVATE if ct == "private" else MORNING_PROB_GROUP
         if random.random() < p:
-            ctx = make_context_snippet(chat_id)
-            try_generate_and_send(chat_id, "morning", "morning", context=ctx)
+            try_generate_and_send(chat_id, "morning")
         mark_today(chat_id, "morning_done", date_str)
         return
 
@@ -1292,29 +1235,30 @@ def proactive_tick_for_chat(chat_id: int):
     if now_ts >= evening_plan and not got_today(chat_id, "evening_done", date_str):
         p = EVENING_PROB_PRIVATE if ct == "private" else EVENING_PROB_GROUP
         if random.random() < p:
-            ctx = make_context_snippet(chat_id)
-            try_generate_and_send(chat_id, "evening", "evening", context=ctx)
+            try_generate_and_send(chat_id, "evening")
         mark_today(chat_id, "evening_done", date_str)
         return
 
-    if ct == "private" and not got_today(chat_id, "checkin_done", date_str):
-        hours = (now_ts - last_user) / 3600.0
-        if CHECKIN_MIN_H <= hours <= CHECKIN_MAX_H and random.random() < CHECKIN_PROB:
-            ctx = make_context_snippet(chat_id)
-            try_generate_and_send(chat_id, "checkin", "checkin", context=ctx)
-            mark_today(chat_id, "checkin_done", date_str)
-            return
-
-    if ct in ("group", "supergroup") and not got_today(chat_id, "ambient_done", date_str):
-        idle_min = (now_ts - last_user) / 60.0
-        if idle_min >= GROUP_AMBIENT_IDLE_MIN and random.random() < GROUP_AMBIENT_PROB:
-            ctx = make_context_snippet(chat_id)
-            try_generate_and_send(chat_id, "ambient_group", "ambient_group", context=ctx)
-            mark_today(chat_id, "ambient_done", date_str)
-            return
+def proactive_loop():
+    if not PROACTIVE_ENABLED:
+        log("Proactive engine disabled.")
+        return
+    log("Proactive engine enabled. TZ =", TZ_NAME)
+    while True:
+        try:
+            if SUMMARY_ENABLED:
+                for cid in list_known_chats(days=14):
+                    if can_update_summary_now(cid):
+                        update_summary(cid)
+            for cid in list_known_chats(days=14):
+                proactive_tick_for_chat(cid)
+            time.sleep(max(15, PROACTIVE_LOOP_SEC))
+        except Exception as e:
+            log("proactive loop error:", repr(e))
+            time.sleep(60)
 
 # ============================================================
-# Workers
+# Interjection worker
 # ============================================================
 
 def process_interjection(chat_id: int):
@@ -1322,57 +1266,28 @@ def process_interjection(chat_id: int):
     if not lock.acquire(timeout=1.5):
         return
     try:
-        hist = get_history(chat_id, 14)
-        user_lines = [m["content"] for m in hist if m["role"] == "user"][-8:]
+        hist = get_history(chat_id, 12)
+        user_lines = [m["content"] for m in hist if m["role"] == "user"][-7:]
         context = "\n".join(user_lines).strip()
         if not context:
             return
-
-        last_text = meta_get(f"proactive_last_text:{chat_id}", "").strip()
-        msgs = build_messages_mode(chat_id, "interject", context=context, last_proactive=last_text)
-        text = llm_chat(msgs, max_tokens=140).strip()
+        msgs = build_messages_mode(chat_id, "interject", context=context)
+        text = llm_chat(msgs, max_tokens=120).strip()
         if not text:
             return
-
-        text = strip_memory_dump(text)
-        text = soften_addressing(text, allow_family=False)
-        text = adjust_kaomoji(text, user_text="")
-        text = normalize_chat_reply(text)
-
+        text = normalize_chat_reply(adjust_kaomoji(text, user_text=""))
         time.sleep(human_read_delay())
         typing_sleep(chat_id, calc_typing_seconds(text))
         send_message(chat_id, text, None)
         save_message(chat_id, "assistant", text, ts=int(time.time()))
         mark_interject(chat_id)
-
     except Exception as e:
         log("interject error:", repr(e))
     finally:
         lock.release()
 
-def proactive_loop():
-    if not PROACTIVE_ENABLED:
-        log("Proactive engine disabled.")
-        return
-    log("Proactive engine enabled. TZ =", TZ_NAME)
-
-    while True:
-        try:
-            if SUMMARY_ENABLED:
-                for cid in list_known_chats(days=14):
-                    if can_update_summary_now(cid):
-                        update_summary(cid)
-
-            for cid in list_known_chats(days=14):
-                proactive_tick_for_chat(cid)
-
-            time.sleep(max(15, PROACTIVE_LOOP_SEC))
-        except Exception as e:
-            log("proactive loop error:", repr(e))
-            time.sleep(60)
-
 # ============================================================
-# Main worker (replies)
+# Main worker
 # ============================================================
 
 def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_id: int):
@@ -1400,13 +1315,11 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
                            allow_split=False, allow_family=False, user_text_for_style=text)
                 return
             if cmd == "status":
-                ct = get_chat_type(chat_id) or "unknown"
-                en = proactive_enabled_for_chat(chat_id)
                 dt = now_msk()
                 ds = msk_date_str(dt)
                 cnt = get_daily_count(chat_id, ds)
                 cap = daily_cap_for_chat(chat_id)
-                msg = f"статус: chat_type={ct}, proactive={'on' if en else 'off'}, сегодня={cnt}/{cap}, время мск={msk_time_str(dt)}."
+                msg = f"статус: proactive={'on' if proactive_enabled_for_chat(chat_id) else 'off'}, сегодня={cnt}/{cap}, время мск={msk_time_str(dt)}, db={_active_db_path}."
                 send_human(chat_id, msg, reply_to_message_id, allow_split=False, allow_family=False, user_text_for_style=text)
                 return
 
@@ -1417,9 +1330,7 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
         display_name = prof.get("display_name") or prof.get("tg_first_name") or None
 
         relationship = prof.get("relationship") or None
-        is_creator = (relationship == "creator")
-        is_mother = (relationship == "mother")
-        allow_family = is_creator or is_mother
+        allow_family = relationship in ("creator", "mother")
 
         if asks_my_name(text):
             if display_name:
@@ -1435,12 +1346,10 @@ def process_message(chat_id: int, from_user: dict, text: str, reply_to_message_i
             return
 
         messages, allow_family = build_messages_reply(chat_id, user_id, text)
-        reply = llm_chat(messages)
-
+        reply = llm_chat(messages).strip()
         if not reply:
             reply = "не уловила. перефразируй одним предложением. (・_・;)"
 
-        # anti-snowball: avoid repeating last assistant content
         last_assistant = get_last_assistant_text(chat_id)
         reply = dedupe_against_last_assistant(reply, last_assistant)
 
@@ -1490,20 +1399,17 @@ def webhook():
     except Exception:
         pass
 
-    # Always store stream (so Yui “listens”) with Telegram timestamp
+    # Always store stream
     try:
         uid = from_user.get("id")
         if uid:
             upsert_profile_from_tg(from_user)
 
-            # name-tagging for group history to avoid mixing users
             prof = get_profile(uid) or {}
             disp = prof.get("display_name") or from_user.get("first_name") or from_user.get("username") or str(uid)
             disp = str(disp).strip()
-            if chat_type in ("group", "supergroup"):
-                visible = f"{disp}: {text}"
-            else:
-                visible = text
+
+            visible = f"{disp}: {text}" if chat_type in ("group", "supergroup") else text
 
             save_message(chat_id, "user", visible, ts=msg_ts)
             save_message(chat_id, "user", f"[u:{uid}] {text}", ts=msg_ts)
@@ -1513,7 +1419,6 @@ def webhook():
     except Exception as e:
         log("save stream error:", repr(e))
 
-    # Normal reply path
     if should_reply(msg):
         reply_to_message_id = msg.get("message_id")
         threading.Thread(
@@ -1523,7 +1428,6 @@ def webhook():
         ).start()
         return "ok"
 
-    # Smart interjection path
     if should_interject(msg):
         threading.Thread(target=process_interjection, args=(chat_id,), daemon=True).start()
 
@@ -1543,7 +1447,13 @@ def set_webhook():
     except Exception as e:
         log("setWebhook failed:", repr(e))
 
-init_db()
+# init db (with recovery)
+try:
+    init_db(force=True)
+except Exception as e:
+    log("init_db failed:", repr(e))
+    recover_or_fallback_db()
+
 seed_family_profiles()
 refresh_bot_id()
 set_webhook()
