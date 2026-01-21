@@ -26,6 +26,12 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "accounts/fireworks/models/llama-v3p3-7
 
 DB_PATH = os.getenv("DB_PATH", "/var/data/memory.db")
 
+# --- SQLite lock hardening (fix: OperationalError 'database is locked')
+DB_TIMEOUT_SEC = float(os.getenv("DB_TIMEOUT_SEC", "30"))
+DB_BUSY_TIMEOUT_MS = int(os.getenv("DB_BUSY_TIMEOUT_MS", "12000"))
+DB_RETRY_TRIES = int(os.getenv("DB_RETRY_TRIES", "12"))
+DB_RETRY_BASE_SLEEP = float(os.getenv("DB_RETRY_BASE_SLEEP", "0.18"))
+
 # Memory sizes (token cost!)
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "55"))
 USER_HISTORY_LIMIT = int(os.getenv("USER_HISTORY_LIMIT", "22"))
@@ -101,7 +107,9 @@ MOTHER_USER_ID = int(os.getenv("MOTHER_USER_ID", "725485618"))
 MOTHER_NICK = os.getenv("MOTHER_NICK", "мама")
 
 app = Flask(__name__)
-_db_lock = threading.Lock()
+
+# IMPORTANT: RLock allows nested locking (db_safe -> init_db -> _db etc.)
+_db_lock = threading.RLock()
 
 def log(*a):
     print("[YUI]", *a, flush=True)
@@ -180,9 +188,11 @@ def normalize_chat_reply(text: str) -> str:
     if not t:
         return t
 
+    # keep acronyms like NEZ / AI / ИИ at the very start
     if _ACRONYM_RE.match(t):
         return t
 
+    # lower-case first alphabetic char (latin/cyrillic)
     for i, ch in enumerate(t):
         if ch.isalpha():
             if ch.isupper():
@@ -228,12 +238,22 @@ def random_time_in_window(date_dt: datetime, start_h: float, end_h: float) -> da
     return base + timedelta(minutes=pick, seconds=random.randint(0, 49))
 
 # ============================================================
-# DB helpers + auto-repair
+# DB helpers + auto-repair + lock hardening
 # ============================================================
 
 def _db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=DB_TIMEOUT_SEC)
     conn.row_factory = sqlite3.Row
+    try:
+        # WAL reduces writer/reader contention massively
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS};")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        # optional: small cache boost
+        conn.execute("PRAGMA cache_size=-20000;")  # ~20MB
+    except Exception:
+        pass
     return conn
 
 def ensure_columns(conn, table: str, cols: dict[str, str]):
@@ -247,16 +267,12 @@ def init_db():
         conn = _db()
         cur = conn.cursor()
 
-        # A) messages now stores author info (user_id/user_name/msg_id)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 chat_id INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
-                ts INTEGER NOT NULL,
-                user_id INTEGER,
-                user_name TEXT,
-                msg_id INTEGER
+                ts INTEGER NOT NULL
             )
         """)
         ensure_columns(conn, "messages", {
@@ -264,10 +280,14 @@ def init_db():
             "role": "TEXT",
             "content": "TEXT",
             "ts": "INTEGER",
-            "user_id": "INTEGER",
-            "user_name": "TEXT",
-            "msg_id": "INTEGER",
         })
+
+        # helpful indexes for speed
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_role_ts ON messages(chat_id, role, ts)")
+        except Exception:
+            pass
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS profiles (
@@ -295,22 +315,37 @@ def init_db():
         conn.commit()
         conn.close()
 
-def db_safe(fn, *, tries=2):
+def db_safe(fn, *, tries: int | None = None):
+    tries = int(tries or DB_RETRY_TRIES)
     last = None
-    for _ in range(tries):
+
+    for i in range(tries):
         try:
-            return fn()
+            # serialize db operations inside the process (threads)
+            with _db_lock:
+                return fn()
+
         except sqlite3.OperationalError as e:
             last = e
             msg = str(e).lower()
+
+            # main Render failure: concurrent writes
+            if ("database is locked" in msg) or ("database schema is locked" in msg) or ("locked" == msg.strip()):
+                time.sleep(DB_RETRY_BASE_SLEEP + i * 0.22 + random.uniform(0.0, 0.18))
+                continue
+
+            # schema repair
             if ("no such table" in msg) or ("no such column" in msg) or ("disk i/o" in msg):
                 log("DB repair triggered:", repr(e))
                 try:
                     init_db()
                 except Exception as e2:
                     log("DB init failed:", repr(e2))
+                time.sleep(0.25 + random.uniform(0.0, 0.2))
                 continue
+
             raise
+
     raise last
 
 def seed_family_profiles():
@@ -331,62 +366,31 @@ def seed_family_profiles():
         conn.close()
     return db_safe(_do)
 
-# B) save_message stores author info (optional)
-def save_message(
-    chat_id: int,
-    role: str,
-    content: str,
-    ts: int | None = None,
-    user_id: int | None = None,
-    user_name: str | None = None,
-    msg_id: int | None = None,
-):
+def save_message(chat_id: int, role: str, content: str, ts: int | None = None):
     ts2 = int(ts) if ts is not None else int(time.time())
     def _do():
         conn = _db()
         conn.execute(
-            "INSERT INTO messages (chat_id, role, content, ts, user_id, user_name, msg_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, role, content, ts2, user_id, user_name, msg_id)
+            "INSERT INTO messages (chat_id, role, content, ts) VALUES (?, ?, ?, ?)",
+            (chat_id, role, content, ts2)
         )
         conn.commit()
         conn.close()
     return db_safe(_do)
 
-# D) get_history prefixes user messages with author in groups
 def get_history(chat_id: int, limit: int):
     """General chat history (EXCLUDES tagged duplicates like [u:123] ...)."""
-    chat_type = get_chat_type(chat_id) or ""
     def _do():
         conn = _db()
         rows = conn.execute(
-            "SELECT role, content, user_id, user_name FROM messages "
+            "SELECT role, content FROM messages "
             "WHERE chat_id=? AND content NOT LIKE '[u:%' "
             "ORDER BY ts DESC LIMIT ?",
             (chat_id, limit)
         ).fetchall()
         conn.close()
-
         rows2 = list(reversed(rows))
-        out: list[dict] = []
-        for r in rows2:
-            role = r["role"]
-            c = (r["content"] or "").strip()
-            if not c:
-                continue
-
-            if role == "user" and chat_type in ("group", "supergroup"):
-                nm = (r["user_name"] or "").strip()
-                uid = r["user_id"]
-                tag = nm if nm else (f"id{uid}" if uid else "user")
-                # keep it compact / single-line-ish
-                tag = re.sub(r"[\r\n\t]+", " ", tag).strip()
-                if len(tag) > 48:
-                    tag = tag[:48] + "…"
-                c = f"{tag}: {c}"
-
-            out.append({"role": role, "content": c})
-        return out
+        return [{"role": r["role"], "content": r["content"]} for r in rows2]
     return db_safe(_do)
 
 def get_user_history_in_chat(chat_id: int, user_id: int, limit: int):
@@ -663,6 +667,7 @@ def maybe_learn_music_alias(user_id: int, text: str) -> str | None:
                 return alias
     return None
 
+# Simple creator-only control commands
 def parse_control_cmd(text: str) -> str | None:
     t = (text or "").strip().lower()
     if t in ("/yui_silent", "юи тише", "юи молчи", "юи офф", "юи выключись"):
@@ -770,6 +775,7 @@ def is_reply_to_yui(msg: dict) -> bool:
     return BOT_ID is not None and frm.get("id") == BOT_ID
 
 def _mentions_this_bot(text: str, entities: list[dict]) -> bool:
+    """Return True only if message mentions @<this bot>."""
     if not BOT_USERNAME or not text or not entities:
         return False
     target = "@" + BOT_USERNAME.lower()
@@ -859,6 +865,7 @@ def should_interject(msg: dict) -> bool:
     if random.random() > INTERJECT_PROB:
         return False
 
+    # avoid interjecting in quiet hours unless it's clearly emotional
     dt = now_msk()
     if in_quiet_hours(dt) and not any(k in t for k in EMO_TRIGGERS):
         return False
@@ -951,9 +958,8 @@ def update_summary(chat_id: int):
             "Ты пишешь краткую память-выжимку для будущих разговоров. "
             "Сделай обновлённое резюме чата 6–10 строк максимум. "
             "Фокус: устойчивые факты, отношения, текущие темы, предпочтения, важные договорённости. "
-            "Не перечисляй всё подряд, не цитируй, не пиши лишнюю драму. "
-            "Не придумывай фактов. "
-            "Пиши по-русски."
+            "Не перечисляй всё подряд, не цитируй. "
+            "Не придумывай фактов. Пиши по-русски."
         )
 
         msgs = [
@@ -1013,7 +1019,6 @@ def add_time_system(messages: list[dict], *, extra: str = ""):
         "content": f"локальное время в москве: {msk_time_str(dt)} (msk), дата: {msk_date_str(dt)}. {extra}".strip()
     })
 
-# E+F) build_messages_reply: user_history becomes system memory (not user turns) + anchor rule
 def build_messages_reply(chat_id: int, user_id: int, text: str) -> tuple[list[dict], bool]:
     meta_user, allow_family = build_user_card(user_id)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
@@ -1035,31 +1040,10 @@ def build_messages_reply(chat_id: int, user_id: int, text: str) -> tuple[list[di
 
     messages += get_history(chat_id, HISTORY_LIMIT)
 
-    # user-specific memory as SYSTEM, not as extra "user" turns
     u_hist = get_user_history_in_chat(chat_id, user_id, USER_HISTORY_LIMIT)
     if u_hist:
-        lines = []
-        for m in u_hist[-10:]:
-            c = (m.get("content") or "").strip()
-            if not c:
-                continue
-            if len(c) > 200:
-                c = c[:200] + "…"
-            lines.append("• " + c)
-        if lines:
-            messages.append({
-                "role": "system",
-                "content": "память о стиле/темах этого пользователя (не отвечай на эти строки отдельно, только для персонализации):\n"
-                           + "\n".join(lines)
-            })
-
-    # F) anchor: answer only the current user message
-    messages.append({
-        "role": "system",
-        "content": "важно: отвечай ТОЛЬКО на текущее сообщение пользователя. "
-                   "не продолжай старую тему, если её не упомянули сейчас. "
-                   "не отвечай на вопросы из памяти/истории, если их нет в текущей реплике."
-    })
+        messages.append({"role": "system", "content": "Сообщения этого пользователя ранее (для контекста, не пересказывать):"})
+        messages += u_hist
 
     return messages, allow_family
 
@@ -1187,9 +1171,6 @@ def mark_today(chat_id: int, tag: str, date_str: str):
 
 def get_last_user_ts(chat_id: int) -> int:
     return int(meta_get(f"last_user_ts:{chat_id}", "0") or 0)
-
-def planned_ts(chat_id: int, kind: str, date_str: str) -> int:
-    return int(meta_get(f"plan:{kind}:{chat_id}:{date_str}", "0") or 0)
 
 def ensure_daily_plan(chat_id: int, kind: str, date_str: str, start_h: float, end_h: float) -> int:
     k = f"plan:{kind}:{chat_id}:{date_str}"
@@ -1495,20 +1476,12 @@ def webhook():
     except Exception:
         pass
 
-    # C) store stream with author info (user_name + msg_id)
     try:
-        uid = (from_user or {}).get("id")
+        uid = from_user.get("id")
         if uid:
             upsert_profile_from_tg(from_user)
-
-            first = (from_user or {}).get("first_name") or ""
-            last = (from_user or {}).get("last_name") or ""
-            uname = (first + " " + last).strip() or ((from_user or {}).get("username") or "")
-            mid = int(msg.get("message_id") or 0) or None
-
-            save_message(chat_id, "user", text, ts=msg_ts, user_id=uid, user_name=uname, msg_id=mid)
-            save_message(chat_id, "user", f"[u:{uid}] {text}", ts=msg_ts, user_id=uid, user_name=uname, msg_id=mid)
-
+            save_message(chat_id, "user", text, ts=msg_ts)
+            save_message(chat_id, "user", f"[u:{uid}] {text}", ts=msg_ts)
             meta_set(f"last_user_ts:{chat_id}", str(msg_ts))
             maybe_schedule_summary_update(chat_id, msg_ts)
     except Exception as e:
