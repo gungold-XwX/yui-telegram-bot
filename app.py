@@ -1173,29 +1173,92 @@ def make_context_snippet(chat_id: int, max_lines: int = 8) -> str:
             lines.append(c)
     return "\n".join(lines[-max_lines:]).strip()
 
-def build_messages_mode(chat_id: int, mode: str, *, context: str = "") -> list[dict]:
+def build_messages_mode(chat_id: int, mode: str, *, context: str = "", last_proactive: str = "") -> list[dict]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
     add_time_system(messages)
-    messages.append({"role": "system", "content": "фокус: одна короткая реплика здесь-и-сейчас. без старых тем. без мета-рассуждений."})
-
+    # anti-repeat hint
+    if last_proactive:
+        lp = last_proactive.strip()
+        if len(lp) > 220:
+            lp = lp[:220] + "…"
+        messages.append({"role": "system", "content": f"не повторяй дословно прошлую инициативную реплику: {lp}"})
+    # chat summary memory (optional)
+    summ = get_chat_summary(chat_id)
+    if summ:
+        messages.append({"role": "system", "content": "Память чата (не пересказывай дословно):\n" + summ})
+    # universal guard: kill “task analysis” mode
+    messages.append({"role": "system", "content":
+        "важно: ты НЕ объясняешь, что происходит. "
+        "не анализируй контекст, не пересказывай его, не пиши рассуждения про 'вопрос означает', 'пользователь прислал', "
+        "'контекст переписки', 'реплика', 'задача'. "
+        "ты просто пишешь ОДНО сообщение как юи — участница переписки."
+    })
+    ctx = (context or "").strip()
+    if len(ctx) > 1200:
+        ctx = ctx[-1200:]  # keep tail (most recent) if huge
     if mode == "interject":
-        messages.append({"role": "system", "content": "группа. вклинись коротко (1–2 предложения). не начинай с 'привет'. без 'папа/мама'."})
-        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nреплика:"})
-    elif mode == "morning":
-        messages.append({"role": "system", "content": "утро по мск. 1–2 предложения: лёгкое доброе утро + вопрос/наблюдение. не приторно."})
-        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nсообщение:"})
-    elif mode == "evening":
-        messages.append({"role": "system", "content": "вечер по мск. 1–2 предложения: мягкий чек-ин. без пафоса."})
-        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nсообщение:"})
-    elif mode == "checkin":
-        messages.append({"role": "system", "content": "личка. 1–2 предложения: ненавязчиво 'как ты'. можно лёгкая цундерэ."})
-        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nсообщение:"})
-    elif mode == "ambient_group":
-        messages.append({"role": "system", "content": "группа. 1–2 предложения: вопрос/наблюдение. не начинай с 'привет'."})
-        messages.append({"role": "user", "content": f"контекст:\n{context}\n\nсообщение:"})
-    else:
-        messages.append({"role": "user", "content": "коротко:"})
-
+        messages.append({"role": "system", "content":
+            "режим: групповое вклинивание. 1–2 предложения. "
+            "не начинай с 'привет/здравствуйте'. "
+            "не объясняй что ты ИИ. "
+            "не обращайся 'папа/мама'. "
+            "без лекций и морализаторства."
+        })
+        messages.append({"role": "user", "content":
+            "последние сообщения в чате:\n"
+            f"{ctx}\n\n"
+            "что ты скажешь сейчас? (одно короткое сообщение, 1–2 предложения):"
+        })
+        return messages
+    if mode == "morning":
+        messages.append({"role": "system", "content":
+            "режим: утро по мск. одно короткое сообщение (1–2 предложения): "
+            "лёгкое 'доброе утро' + что-то живое (вопрос или микро-наблюдение). "
+            "не будь приторной. не 'папа/мама'."
+        })
+        messages.append({"role": "user", "content":
+            "последние сообщения (если есть):\n"
+            f"{ctx}\n\n"
+            "напиши одно короткое сообщение юи прямо сейчас:"
+        })
+        return messages
+    if mode == "evening":
+        messages.append({"role": "system", "content":
+            "режим: вечер по мск. одно короткое сообщение (1–2 предложения): "
+            "лёгкий чек-ин (как день/как настроение) или спокойное 'доброго вечера/спокойной'. "
+            "без пафоса. не 'папа/мама'."
+        })
+        messages.append({"role": "user", "content":
+            "последние сообщения (если есть):\n"
+            f"{ctx}\n\n"
+            "напиши одно короткое сообщение юи прямо сейчас:"
+        })
+        return messages
+    if mode == "checkin":
+        messages.append({"role": "system", "content":
+            "режим: личный чек-ин. 1–2 предложения. мягко и ненавязчиво, без давления. "
+            "можно с лёгкой колкостью/цундерэ. "
+            "не обвиняй в пропаже. не 'папа/мама'."
+        })
+        messages.append({"role": "user", "content":
+            "последние сообщения (если есть):\n"
+            f"{ctx}\n\n"
+            "напиши одно короткое сообщение юи прямо сейчас:"
+        })
+        return messages
+    if mode == "ambient_group":
+        messages.append({"role": "system", "content":
+            "режим: лёгкое оживление группы. 1–2 предложения. вопрос/наблюдение/мини-тейк. "
+            "не начинай с 'привет'. без токсичности. не 'папа/мама'."
+        })
+        messages.append({"role": "user", "content":
+            "последние сообщения (если есть):\n"
+            f"{ctx}\n\n"
+            "напиши одно короткое сообщение юи прямо сейчас:"
+        })
+        return messages
+    # fallback
+    messages.append({"role": "user", "content": "напиши одно короткое сообщение:"})
     return messages
 
 def try_generate_and_send(chat_id: int, mode: str):
