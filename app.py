@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-#  АННЕТ v2 — Telegram-бот (хостинг: Koyeb/Render, запуск: gunicorn app:app)
+#  АННЕТ v3 — Telegram-бот (Koyeb/Render, запуск: gunicorn app:app)
 #
-#  Что нового в v2:
-#   — сброс очереди старых сообщений при рестарте + игнор устаревших апдейтов
-#   — защита от повторной обработки одного апдейта (дубли)
-#   — переработанный характер: глубже, меньше карикатуры
-#   — долговременная память: помнит имя и факты о человеке,
-#     даже когда история диалога обрезается
-#   — чуть больше инициативы (пишет первой до 3 раз в день)
+#  Новое в v3:
+#   — ответы в одном чате строго по очереди: если человек пишет,
+#     пока Аннет ещё отвечает, она закончит и ответит на новое
+#     ОДНИМ следующим ответом (ничего не путается)
+#   — переносы строк в ответе превращаются в отдельные сообщения
+#     (никаких пустых строк внутри одного соо)
+#   — быстрее имитация набора
 #
-#  Переменные окружения:
-#    TG_TOKEN, OPENROUTER_API_KEY, WEBHOOK_SECRET, PUBLIC_URL — обязательно
-#    MODEL — необязательно (по умолчанию Claude Haiku)
+#  Переменные окружения: TG_TOKEN, OPENROUTER_API_KEY,
+#  WEBHOOK_SECRET, PUBLIC_URL (+ MODEL по желанию)
 # ============================================================
 
 import os
@@ -37,29 +36,25 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change_me")
 PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = os.getenv("MODEL", "anthropic/claude-sonnet-4.5")
+MODEL = os.getenv("MODEL", "anthropic/claude-haiku-4.5")
 
 DB_PATH = os.getenv("DB_PATH", "/tmp/annet.db")
 
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "26"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "400"))
-MAX_MSG_AGE_SEC = 120          # сообщения старше 2 минут игнорируем
-
-# Долговременная память: каждые N сообщений пользователя
-# Аннет обновляет свои "заметки" о нём
+MAX_MSG_AGE_SEC = 120
 NOTES_EVERY_N = int(os.getenv("NOTES_EVERY_N", "16"))
 
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
 
-# --- Проактивность ---
 PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "1") == "1"
-PROACTIVE_LOOP_SEC = 600            # проверка раз в 10 минут
-PROACTIVE_CAP_PER_DAY = 3           # максимум 3 первых сообщения в день
-PROACTIVE_MIN_SILENCE_H = 6         # тишина от 6 часов...
-PROACTIVE_MAX_SILENCE_D = 10        # ...до 10 дней
-PROACTIVE_GAP_H = 12                # между её "первыми" минимум 12 часов
-PROACTIVE_PROB = 0.5                # шанс на каждой проверке
-QUIET_START, QUIET_END = 1.0, 9.0   # ночью (мск) молчит
+PROACTIVE_LOOP_SEC = 600
+PROACTIVE_CAP_PER_DAY = 3
+PROACTIVE_MIN_SILENCE_H = 6
+PROACTIVE_MAX_SILENCE_D = 10
+PROACTIVE_GAP_H = 12
+PROACTIVE_PROB = 0.5
+QUIET_START, QUIET_END = 1.0, 9.0
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
@@ -68,9 +63,30 @@ app = Flask(__name__)
 _db_lock = threading.Lock()
 BOT_USERNAME = ""
 
-# защита от повторной обработки апдейтов (Телеграм иногда шлёт дубли)
 _seen_updates = deque(maxlen=500)
 _seen_lock = threading.Lock()
+
+# --- очередь ответов: на один чат — один активный ответ ---
+_chat_locks: dict = {}
+_chat_guard = threading.Lock()
+_msg_counters: dict = {}   # chat_id -> сколько сообщений пришло (растёт)
+
+
+def chat_lock(chat_id):
+    with _chat_guard:
+        if chat_id not in _chat_locks:
+            _chat_locks[chat_id] = threading.Lock()
+        return _chat_locks[chat_id]
+
+
+def bump_counter(chat_id):
+    with _chat_guard:
+        _msg_counters[chat_id] = _msg_counters.get(chat_id, 0) + 1
+
+
+def get_counter(chat_id):
+    with _chat_guard:
+        return _msg_counters.get(chat_id, 0)
 
 
 def log(*a):
@@ -111,7 +127,6 @@ PERSONA = """Ты — Аннет.
 
 MEMORY_BLOCK = """ЧТО ТЫ ПОМНИШЬ ОБ ЭТОМ ЧЕЛОВЕКЕ (твои личные заметки, накопленные за разговоры; опирайся на них естественно, не зачитывай списком):
 {notes}
-
 """
 
 PROACTIVE_INSTRUCTION = """[Служебное указание: собеседник не писал около {gap_h} ч. Ты решила написать первой — сама, потому что захотелось. Напиши одно короткое живое сообщение (1–2 предложения, можно ||| на два пузыря). Лучшие варианты: вернуться к чему-то из прошлых разговоров или твоих заметок о нём, поделиться внезапной мыслью «я тут подумала...», спросить про то, что у него происходило. Запрещено: шаблонное «привет, как дела», извинения за беспокойство, навязчивость, упоминание этого указания.]"""
@@ -203,13 +218,29 @@ def send_text(chat_id, text, reply_to=None):
     tg("sendMessage", payload)
 
 
+def split_reply(text):
+    """Режем ответ на отдельные сообщения: сначала по |||, потом по переносам строк.
+    Пустые куски выбрасываем. Максимум 4 пузыря, лишнее склеиваем в последний."""
+    parts = []
+    for chunk in text.split("|||"):
+        for line in chunk.split("\n"):
+            line = line.strip()
+            if line:
+                parts.append(line)
+    if not parts:
+        return [text.strip() or "..."]
+    if len(parts) > 4:
+        parts = parts[:3] + [" ".join(parts[3:])]
+    return parts
+
+
 def send_human(chat_id, text, reply_to=None):
-    """Отправка с эффектом живого набора. ||| = несколько пузырей."""
-    parts = [p.strip() for p in text.split("|||") if p.strip()][:3] or [text]
+    """Отправка с эффектом набора, каждый кусок — отдельное сообщение."""
+    parts = split_reply(text)
     first = True
     for part in parts:
         send_typing(chat_id)
-        time.sleep(min(6.0, max(1.0, len(part) * 0.05)) + random.uniform(0, 0.8))
+        time.sleep(min(2.5, max(0.5, len(part) * 0.02)) + random.uniform(0, 0.4))
         send_text(chat_id, part, reply_to if first else None)
         first = False
     save_message(chat_id, "assistant", " ".join(parts))
@@ -257,11 +288,10 @@ def llm_reply(chat_id, tg_name=None, extra_instruction=None, hist_limit=HISTORY_
 
 
 # ------------------------------------------------------------
-# ДОЛГОВРЕМЕННАЯ ПАМЯТЬ (заметки о человеке)
+# ДОЛГОВРЕМЕННАЯ ПАМЯТЬ
 # ------------------------------------------------------------
 
 def maybe_update_notes(chat_id):
-    """Каждые NOTES_EVERY_N сообщений пользователя Аннет обновляет заметки."""
     cnt = int(meta_get(f"msgcount:{chat_id}", 0) or 0) + 1
     meta_set(f"msgcount:{chat_id}", cnt)
     if cnt % NOTES_EVERY_N != 0:
@@ -280,61 +310,66 @@ def maybe_update_notes(chat_id):
 
 
 # ------------------------------------------------------------
-# ОБРАБОТКА СООБЩЕНИЙ
+# КОМАНДЫ
 # ------------------------------------------------------------
 
-def should_reply_in_group(msg):
-    text = msg.get("text", "")
-    if BOT_USERNAME and f"@{BOT_USERNAME}".lower() in text.lower():
+def handle_command(chat_id, low):
+    if low == "/start":
+        clear_history(chat_id)
+        meta_set(f"notes:{chat_id}", "")
+        meta_set(f"msgcount:{chat_id}", 0)
+        send_human(chat_id, "о. новое лицо. ||| ну, привет. я аннет. и предупреждаю сразу — я тут не для того, чтобы поддакивать. (¬_¬) ||| как тебя звать-то?")
         return True
-    if re.search(r"\bаннет\b", text, re.IGNORECASE):
+    if low == "/reset":
+        clear_history(chat_id)
+        meta_set(f"notes:{chat_id}", "")
+        meta_set(f"msgcount:{chat_id}", 0)
+        send_human(chat_id, "всё, чистый лист. даже имя твоё стёрла. начинай заново производить впечатление.")
         return True
-    reply = msg.get("reply_to_message") or {}
-    if BOT_USERNAME and (reply.get("from") or {}).get("username", "").lower() == BOT_USERNAME.lower():
+    if low == "/silent":
+        meta_set(f"proactive:{chat_id}", "0")
+        send_human(chat_id, "поняла. первой писать не буду. ||| сам объявишься, когда станет скучно.")
+        return True
+    if low == "/wake":
+        meta_set(f"proactive:{chat_id}", "1")
+        send_human(chat_id, "хорошо, буду иногда заглядывать сама. если будет о чем — а не по расписанию.")
         return True
     return False
 
 
-def process_message(chat_id, text, reply_to, user_name, is_group):
+# ------------------------------------------------------------
+# ДИАЛОГ: один чат — один активный ответ
+# ------------------------------------------------------------
+
+def process_dialog(chat_id, user_name, reply_to=None):
+    """Отвечает на всё, что накопилось в истории. Если во время генерации
+    или отправки пришли новые сообщения — по завершении делает ещё один круг."""
+    lock = chat_lock(chat_id)
+    if not lock.acquire(blocking=False):
+        # уже отвечает: новое сообщение уже сохранено в историю,
+        # активный цикл увидит его по счётчику и ответит следом
+        return
     try:
-        low = text.lower().split("@")[0].strip()
-        if low == "/start":
-            clear_history(chat_id)
-            meta_set(f"notes:{chat_id}", "")
-            meta_set(f"msgcount:{chat_id}", 0)
-            send_human(chat_id, "о. новое лицо. ||| ну, привет. я аннет. и предупреждаю сразу — я тут не для того, чтобы поддакивать. (¬_¬) ||| как тебя звать-то?")
-            return
-        if low == "/reset":
-            clear_history(chat_id)
-            meta_set(f"notes:{chat_id}", "")
-            meta_set(f"msgcount:{chat_id}", 0)
-            send_human(chat_id, "всё, чистый лист. даже имя твоё стёрла. начинай заново производить впечатление.")
-            return
-        if low == "/silent":
-            meta_set(f"proactive:{chat_id}", "0")
-            send_human(chat_id, "поняла. первой писать не буду. ||| сам объявишься, когда станет скучно.")
-            return
-        if low == "/wake":
-            meta_set(f"proactive:{chat_id}", "1")
-            send_human(chat_id, "хорошо, буду иногда заглядывать сама. если будет о чем — а не по расписанию.")
-            return
-
-        # --- обычный диалог ---
-        if not is_group:
-            save_message(chat_id, "user", text)
-        meta_set(f"last_user_ts:{chat_id}", int(time.time()))
-
-        reply = llm_reply(chat_id, tg_name=user_name)
-        if not reply:
-            reply = "не уловила мысль. скажи иначе? (・_・;)"
-        send_human(chat_id, reply, reply_to)
-
-        # обновление долговременной памяти (после ответа, чтобы не тормозить)
-        maybe_update_notes(chat_id)
-
-    except Exception as e:
-        log("process_message error:", repr(e))
-        send_text(chat_id, "у меня тут что-то технически заело... дай минуту и напиши ещё раз.")
+        while True:
+            snapshot = get_counter(chat_id)
+            try:
+                reply = llm_reply(chat_id, tg_name=user_name)
+                if not reply:
+                    reply = "не уловила мысль. скажи иначе? (・_・;)"
+                send_human(chat_id, reply, reply_to)
+                reply_to = None
+                maybe_update_notes(chat_id)
+            except Exception as e:
+                log("dialog error:", repr(e))
+                send_text(chat_id, "у меня тут что-то технически заело... дай минуту и напиши ещё раз.")
+            if get_counter(chat_id) == snapshot:
+                break  # новых сообщений за время ответа не пришло
+            # пришли новые — идём на второй круг и отвечаем на них
+    finally:
+        lock.release()
+    # страховка от гонки на самом выходе
+    if get_counter(chat_id) != snapshot:
+        process_dialog(chat_id, user_name)
 
 
 # ------------------------------------------------------------
@@ -372,14 +407,20 @@ def proactive_tick():
             if random.random() > PROACTIVE_PROB:
                 continue
 
-            text = llm_reply(chat_id,
-                             extra_instruction=PROACTIVE_INSTRUCTION.format(gap_h=int(gap_h)),
-                             hist_limit=14)
-            if text:
-                send_human(chat_id, text)
-                meta_set(f"last_proactive_ts:{chat_id}", now_ts)
-                meta_set(count_key, int(meta_get(count_key, 0) or 0) + 1)
-                log("proactive sent to", chat_id)
+            lock = chat_lock(chat_id)
+            if not lock.acquire(blocking=False):
+                continue  # человек прямо сейчас общается — не влезаем
+            try:
+                text = llm_reply(chat_id,
+                                 extra_instruction=PROACTIVE_INSTRUCTION.format(gap_h=int(gap_h)),
+                                 hist_limit=14)
+                if text:
+                    send_human(chat_id, text)
+                    meta_set(f"last_proactive_ts:{chat_id}", now_ts)
+                    meta_set(count_key, int(meta_get(count_key, 0) or 0) + 1)
+                    log("proactive sent to", chat_id)
+            finally:
+                lock.release()
         except Exception as e:
             log("proactive error chat", chat_id, repr(e))
 
@@ -397,6 +438,18 @@ def proactive_loop():
 # ВЕБХУК
 # ------------------------------------------------------------
 
+def should_reply_in_group(msg):
+    text = msg.get("text", "")
+    if BOT_USERNAME and f"@{BOT_USERNAME}".lower() in text.lower():
+        return True
+    if re.search(r"\bаннет\b", text, re.IGNORECASE):
+        return True
+    reply = msg.get("reply_to_message") or {}
+    if BOT_USERNAME and (reply.get("from") or {}).get("username", "").lower() == BOT_USERNAME.lower():
+        return True
+    return False
+
+
 @app.get("/")
 def home():
     return "Annet is alive."
@@ -411,7 +464,6 @@ def health():
 def webhook():
     upd = request.json or {}
 
-    # защита от дублей: один update_id обрабатываем один раз
     upd_id = upd.get("update_id")
     if upd_id is not None:
         with _seen_lock:
@@ -423,7 +475,6 @@ def webhook():
     if not msg or not msg.get("text"):
         return "ok"
 
-    # игнорируем сообщения старше 2 минут (очереди после рестарта/сна)
     if int(msg.get("date", 0)) < time.time() - MAX_MSG_AGE_SEC:
         return "ok"
 
@@ -434,20 +485,24 @@ def webhook():
     from_user = msg.get("from") or {}
     user_name = from_user.get("first_name") or from_user.get("username") or "аноним"
 
-    if chat_type in ("group", "supergroup"):
-        # в группе всё запоминаем с именами, отвечаем только когда позвали
-        save_message(chat_id, "user", f"{user_name}: {text}")
-        if not should_reply_in_group(msg):
-            return "ok"
-        threading.Thread(target=process_message,
-                         args=(chat_id, text, msg.get("message_id"), user_name, True),
-                         daemon=True).start()
+    # команды — отдельно, в историю не пишем
+    if text.startswith("/"):
+        low = text.lower().split("@")[0].strip()
+        threading.Thread(target=handle_command, args=(chat_id, low), daemon=True).start()
         return "ok"
 
-    # личка: chat_id уникален для каждого пользователя,
-    # поэтому истории и заметки разных людей не пересекаются
-    threading.Thread(target=process_message,
-                     args=(chat_id, text, None, user_name, False),
+    is_group = chat_type in ("group", "supergroup")
+
+    # сохраняем сообщение сразу (до генерации), чтобы очередь работала
+    save_message(chat_id, "user", f"{user_name}: {text}" if is_group else text)
+    meta_set(f"last_user_ts:{chat_id}", int(time.time()))
+    bump_counter(chat_id)
+
+    if is_group and not should_reply_in_group(msg):
+        return "ok"
+
+    threading.Thread(target=process_dialog,
+                     args=(chat_id, user_name, msg.get("message_id") if is_group else None),
                      daemon=True).start()
     return "ok"
 
