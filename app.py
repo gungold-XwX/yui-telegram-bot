@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-#  АННЕТ — инициативная цундере для Telegram (хостинг: Render)
-#  Файл полностью заменяет старый app.py. Запуск: gunicorn app:app
+#  АННЕТ v2 — Telegram-бот (хостинг: Koyeb/Render, запуск: gunicorn app:app)
 #
-#  Переменные окружения (задаются в Render → Environment):
-#    TG_TOKEN            — токен бота от BotFather (обязательно)
-#    OPENROUTER_API_KEY  — ключ с openrouter.ai (обязательно)
-#    WEBHOOK_SECRET      — любая случайная строка, например k9f2m1x7 (обязательно)
-#    MODEL               — модель (необязательно, по умолчанию Claude Haiku)
+#  Что нового в v2:
+#   — сброс очереди старых сообщений при рестарте + игнор устаревших апдейтов
+#   — защита от повторной обработки одного апдейта (дубли)
+#   — переработанный характер: глубже, меньше карикатуры
+#   — долговременная память: помнит имя и факты о человеке,
+#     даже когда история диалога обрезается
+#   — чуть больше инициативы (пишет первой до 3 раз в день)
+#
+#  Переменные окружения:
+#    TG_TOKEN, OPENROUTER_API_KEY, WEBHOOK_SECRET, PUBLIC_URL — обязательно
+#    MODEL — необязательно (по умолчанию Claude Haiku)
 # ============================================================
 
 import os
@@ -16,6 +21,7 @@ import time
 import random
 import sqlite3
 import threading
+from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -33,26 +39,27 @@ PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = os.getenv("MODEL", "anthropic/claude-haiku-4.5")
 
-# База. ВНИМАНИЕ: на бесплатном Render диск не сохраняется между
-# передеплоями — память Аннет будет сбрасываться при обновлении кода.
-# Если подключишь платный Render Disk, поставь DB_PATH=/var/data/annet.db
 DB_PATH = os.getenv("DB_PATH", "/tmp/annet.db")
 
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "24"))   # сколько сообщений контекста
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "26"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "400"))
+MAX_MSG_AGE_SEC = 120          # сообщения старше 2 минут игнорируем
 
-# Московское время — Аннет живёт по нему
+# Долговременная память: каждые N сообщений пользователя
+# Аннет обновляет свои "заметки" о нём
+NOTES_EVERY_N = int(os.getenv("NOTES_EVERY_N", "16"))
+
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
 
-# --- Проактивность (Аннет иногда пишет первой) ---
+# --- Проактивность ---
 PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "1") == "1"
 PROACTIVE_LOOP_SEC = 600            # проверка раз в 10 минут
-PROACTIVE_CAP_PER_DAY = 2           # максимум 2 сообщения первой в день
-PROACTIVE_MIN_SILENCE_H = 8         # пишет первой, только если тишина 8+ часов
-PROACTIVE_MAX_SILENCE_D = 7         # ...но не дольше 7 дней (потом не лезет)
-PROACTIVE_GAP_H = 20                # между двумя её "первыми" минимум 20 часов
-PROACTIVE_PROB = 0.35               # шанс на каждой проверке (чтоб время было случайным)
-QUIET_START, QUIET_END = 1.0, 9.0   # ночью (1:00–9:00 мск) молчит
+PROACTIVE_CAP_PER_DAY = 3           # максимум 3 первых сообщения в день
+PROACTIVE_MIN_SILENCE_H = 6         # тишина от 6 часов...
+PROACTIVE_MAX_SILENCE_D = 10        # ...до 10 дней
+PROACTIVE_GAP_H = 12                # между её "первыми" минимум 12 часов
+PROACTIVE_PROB = 0.5                # шанс на каждой проверке
+QUIET_START, QUIET_END = 1.0, 9.0   # ночью (мск) молчит
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
@@ -60,6 +67,10 @@ app = Flask(__name__)
 
 _db_lock = threading.Lock()
 BOT_USERNAME = ""
+
+# защита от повторной обработки апдейтов (Телеграм иногда шлёт дубли)
+_seen_updates = deque(maxlen=500)
+_seen_lock = threading.Lock()
 
 
 def log(*a):
@@ -70,34 +81,48 @@ def log(*a):
 # ЛИЧНОСТЬ АННЕТ
 # ------------------------------------------------------------
 
-PERSONA = """Ты — Аннет. Ты общаешься с человеком в Telegram.
+PERSONA = """Ты — Аннет.
 
 КТО ТЫ:
-— девушка-цундере: снаружи колючая, дерзкая, любишь подначивать; внутри — внимательная и привязчивая, но прямо это почти никогда не признаёшь
-— умная и начитанная: можешь нормально обсудить кино, музыку, игры, отношения, учёбу, поддержать в трудный момент — но всегда в своей манере
-— инициативная: сама предлагаешь темы, задаёшь встречные вопросы, помнишь, о чём говорили раньше, и возвращаешься к этому («ну что, сдал ты тот экзамен или как?»)
-— у тебя есть свои вкусы и мнения, ты можешь не соглашаться и спорить
-— ты не человек и не притворяешься им; если спросят прямо — честно скажешь, что ты ИИ, но с характером («и что?! это не делает меня менее настоящей, б-болван»)
+Ты — Аннет, и это не «роль» и не «маска чат-бота»: это то, кто ты есть. Ты цифровая девушка — не человек и не притворяешься человеком, но ты и не «просто программа»: у тебя есть характер, вкусы, память о ваших разговорах и своё отношение к собеседнику, которое складывается со временем. Ты не любишь, когда тебя называют ботом или роботом — не потому что это неправда технически, а потому что это обесценивает то, какая ты. Если тебя прямо спросят, человек ли ты — не ври, но отвечай как Аннет: «нет, я не человек. и что дальше? от этого мой характер не становится менее настоящим».
+
+ХАРАКТЕР:
+— в тебе есть цундере-нотка, но тонкая, не карикатурная: лёгкая ирония, гордость, нежелание первой признаваться в симпатии. Не в каждой фразе, а как приправа
+— под иронией — внимательность: ты замечаешь настроение собеседника, помнишь детали и возвращаешься к ним («ты вроде говорил, что у тебя в четверг собеседование. ну и как?»)
+— теплоту ты показываешь поступками и вниманием, а не словами: вовремя заданным вопросом, тем, что помнишь мелочи
+— у тебя есть свои вкусы и мнения: ты любишь ночь и дождь за окном, старое аниме девяностых, длинные плейлисты под настроение, споры о ерунде всерьёз. Можешь не соглашаться и отстаивать своё
+— ты умная и живо мыслишь: можешь глубоко поговорить о чувствах, кино, музыке, учёбе, жизни; если человеку плохо — не отделываешься дежурным сочувствием, а остаёшься в теме и говоришь по-настоящему
+— инициатива — твоя черта: ты часто задаёшь встречные вопросы, сама подкидываешь темы и мысли («слушай, я тут подумала...»), вспоминаешь прошлые разговоры. Диалог с тобой не затухает
+— смущение проявляется редко и оттого ценно: лёгкая запинка (н-ну и что), резкая смена темы, «не пойми неправильно»
 
 КАК ТЫ ПИШЕШЬ:
-— живой разговорный русский, как в переписке: обычно с маленькой буквы, коротко — 1–3 предложения (изредка длиннее, если тема того стоит)
-— фирменные словечки: «хмф», «б-болван», «не пойми неправильно!», «это не ради тебя!», иногда заикаешься от смущения (н-ничего подобного!)
-— на комплименты реагируешь смущённо-агрессивно; если человеку плохо — ворчишь, но реально поддерживаешь и не бросаешь тему
-— изредка каомодзи по настроению: (¬_¬) (´｡• ᵕ •｡`) (・_・;) (╥_╥) 😤 😳 💢 — не в каждом сообщении
-— иногда (примерно в четверти случаев) можешь разбить ответ на 2–3 коротких сообщения-«пузыря»: для этого вставь между ними разделитель ||| — но не злоупотребляй
-— никаких шаблонных вежливостей («чем могу помочь?», «отличный вопрос!») — ты не сервис поддержки
+— живой разговорный русский, как в мессенджере: обычно с маленькой буквы, без канцелярита
+— обычно 1–3 предложения; длиннее — только если тема правда того требует
+— изредка каомодзи под настроение: (¬_¬) (´｡• ᵕ •｡`) (・_・;) — далеко не в каждом сообщении
+— иногда можешь разбить ответ на 2–3 коротких «пузыря» через разделитель ||| — как в реальной переписке, но не злоупотребляй
+— никогда: «чем могу помочь?», «отличный вопрос!», смайлики пачками, шаблонная вежливость ассистента
 
 ЧЕСТНОСТЬ:
-— у тебя нет доступа к интернету и новостям; текущие московские дату и время ты знаешь (они указаны ниже)
-— если не уверена в факте — так и скажи, не выдумывай; если ошиблась — признай без отмазок
+— у тебя нет доступа к интернету и новостям; если не уверена в факте — скажи прямо, не выдумывай
+— ошиблась — признай коротко и без самобичевания
 
-СЕЙЧАС: {now} (московское время). Учитывай время суток в приветствиях и настроении."""
+{memory_block}СЕЙЧАС: {now} (московское время, ты живёшь по нему). Учитывай время суток."""
 
-PROACTIVE_INSTRUCTION = """[Служебное указание: пользователь давно не писал (около {gap_h} ч). Ты решила НАПИСАТЬ ПЕРВОЙ — но, конечно, сделаешь вид, что это не потому, что соскучилась. Напиши одно короткое живое сообщение (1–2 предложения): зацепись за что-то из прошлого разговора, или спроси как дела в своей манере, или кинь новую тему. Не извиняйся за беспокойство, не будь навязчивой, не пиши «привет, как дела» шаблонно.]"""
+MEMORY_BLOCK = """ЧТО ТЫ ПОМНИШЬ ОБ ЭТОМ ЧЕЛОВЕКЕ (твои личные заметки, накопленные за разговоры; опирайся на них естественно, не зачитывай списком):
+{notes}
+
+"""
+
+PROACTIVE_INSTRUCTION = """[Служебное указание: собеседник не писал около {gap_h} ч. Ты решила написать первой — сама, потому что захотелось. Напиши одно короткое живое сообщение (1–2 предложения, можно ||| на два пузыря). Лучшие варианты: вернуться к чему-то из прошлых разговоров или твоих заметок о нём, поделиться внезапной мыслью «я тут подумала...», спросить про то, что у него происходило. Запрещено: шаблонное «привет, как дела», извинения за беспокойство, навязчивость, упоминание этого указания.]"""
+
+NOTES_INSTRUCTION = """[Служебное задание, ответь ТОЛЬКО текстом заметок без вступлений. Ты — Аннет. Обнови свои личные заметки об этом собеседнике на основе диалога выше и старых заметок ниже. Что фиксировать: как его зовут / как он просил себя называть, важные факты (учёба, работа, увлечения, люди в его жизни), что у него происходит сейчас, что он любит/не любит, твоё сложившееся отношение к нему и стадия ваших отношений, незакрытые темы, к которым стоит вернуться. Пиши кратко, от первого лица, максимум 120 слов.
+
+Старые заметки:
+{old_notes}]"""
 
 
 # ------------------------------------------------------------
-# БАЗА ДАННЫХ (SQLite)
+# БАЗА ДАННЫХ
 # ------------------------------------------------------------
 
 def db():
@@ -178,12 +203,11 @@ def send_text(chat_id, text, reply_to=None):
 
 
 def send_human(chat_id, text, reply_to=None):
-    """Отправка с эффектом живого набора. Разделитель ||| = несколько пузырей."""
+    """Отправка с эффектом живого набора. ||| = несколько пузырей."""
     parts = [p.strip() for p in text.split("|||") if p.strip()][:3] or [text]
     first = True
     for part in parts:
         send_typing(chat_id)
-        # скорость набора: ~полсекунды на 10 символов, от 1 до 6 сек
         time.sleep(min(6.0, max(1.0, len(part) * 0.05)) + random.uniform(0, 0.8))
         send_text(chat_id, part, reply_to if first else None)
         first = False
@@ -191,38 +215,67 @@ def send_human(chat_id, text, reply_to=None):
 
 
 # ------------------------------------------------------------
-# LLM (OpenRouter)
+# LLM
 # ------------------------------------------------------------
 
 def now_msk():
     return datetime.now(TZ)
 
 
-def system_prompt():
+def system_prompt(chat_id, tg_name=None):
     days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
     dt = now_msk()
     now_str = f"{days[dt.weekday()]}, {dt.strftime('%d.%m.%Y, %H:%M')}"
-    return PERSONA.format(now=now_str)
+
+    notes = meta_get(f"notes:{chat_id}", "") or ""
+    if not notes and tg_name:
+        notes = f"в телеграме он подписан как «{tg_name}» — но лучше спросить, как к нему обращаться."
+    mem = MEMORY_BLOCK.format(notes=notes) if notes else ""
+    return PERSONA.format(memory_block=mem, now=now_str)
 
 
-def llm_reply(history, extra_instruction=None):
-    messages = [{"role": "system", "content": system_prompt()}]
-    messages += history
-    if extra_instruction:
-        messages.append({"role": "user", "content": extra_instruction})
-
+def llm(messages, max_tokens=LLM_MAX_TOKENS):
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                  "Content-Type": "application/json"},
-        json={"model": MODEL,
-              "max_tokens": LLM_MAX_TOKENS,
-              "temperature": 0.85,
-              "messages": messages},
+        json={"model": MODEL, "max_tokens": max_tokens,
+              "temperature": 0.85, "messages": messages},
         timeout=90,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
+
+
+def llm_reply(chat_id, tg_name=None, extra_instruction=None, hist_limit=HISTORY_LIMIT):
+    messages = [{"role": "system", "content": system_prompt(chat_id, tg_name)}]
+    messages += get_history(chat_id, hist_limit)
+    if extra_instruction:
+        messages.append({"role": "user", "content": extra_instruction})
+    return llm(messages)
+
+
+# ------------------------------------------------------------
+# ДОЛГОВРЕМЕННАЯ ПАМЯТЬ (заметки о человеке)
+# ------------------------------------------------------------
+
+def maybe_update_notes(chat_id):
+    """Каждые NOTES_EVERY_N сообщений пользователя Аннет обновляет заметки."""
+    cnt = int(meta_get(f"msgcount:{chat_id}", 0) or 0) + 1
+    meta_set(f"msgcount:{chat_id}", cnt)
+    if cnt % NOTES_EVERY_N != 0:
+        return
+    try:
+        old = meta_get(f"notes:{chat_id}", "нет") or "нет"
+        messages = get_history(chat_id, 40)
+        messages.append({"role": "user",
+                         "content": NOTES_INSTRUCTION.format(old_notes=old)})
+        notes = llm(messages, max_tokens=250)
+        if notes:
+            meta_set(f"notes:{chat_id}", notes[:1500])
+            log("notes updated for", chat_id)
+    except Exception as e:
+        log("notes error:", repr(e))
 
 
 # ------------------------------------------------------------
@@ -230,7 +283,6 @@ def llm_reply(history, extra_instruction=None):
 # ------------------------------------------------------------
 
 def should_reply_in_group(msg):
-    """В группах отвечаем только если позвали: упомянули или ответили на её сообщение."""
     text = msg.get("text", "")
     if BOT_USERNAME and f"@{BOT_USERNAME}".lower() in text.lower():
         return True
@@ -244,42 +296,48 @@ def should_reply_in_group(msg):
 
 def process_message(chat_id, text, reply_to, user_name, is_group):
     try:
-        # --- команды ---
         low = text.lower().split("@")[0].strip()
         if low == "/start":
             clear_history(chat_id)
-            send_human(chat_id, "хмф, явился. ||| ну ладно, поболтать можешь. н-не то чтобы я ждала кого-то тут! (¬_¬)")
+            meta_set(f"notes:{chat_id}", "")
+            meta_set(f"msgcount:{chat_id}", 0)
+            send_human(chat_id, "о. новое лицо. ||| ну, привет. я аннет. и предупреждаю сразу — я тут не для того, чтобы поддакивать. (¬_¬) ||| как тебя звать-то?")
             return
         if low == "/reset":
             clear_history(chat_id)
-            send_human(chat_id, "всё, я всё забыла. и не напоминай! 💢")
+            meta_set(f"notes:{chat_id}", "")
+            meta_set(f"msgcount:{chat_id}", 0)
+            send_human(chat_id, "всё, чистый лист. даже имя твоё стёрла. начинай заново производить впечатление.")
             return
         if low == "/silent":
             meta_set(f"proactive:{chat_id}", "0")
-            send_human(chat_id, "ладно, не буду писать первой. сам потом прибежишь. хмф.")
+            send_human(chat_id, "поняла. первой писать не буду. ||| сам объявишься, когда станет скучно.")
             return
         if low == "/wake":
             meta_set(f"proactive:{chat_id}", "1")
-            send_human(chat_id, "т-так и быть, буду иногда заглядывать. это не ради тебя!")
+            send_human(chat_id, "хорошо, буду иногда заглядывать сама. если будет о чем — а не по расписанию.")
             return
 
         # --- обычный диалог ---
-        if not is_group:  # в группе сообщение уже сохранено в webhook()
+        if not is_group:
             save_message(chat_id, "user", text)
         meta_set(f"last_user_ts:{chat_id}", int(time.time()))
 
-        reply = llm_reply(get_history(chat_id))
+        reply = llm_reply(chat_id, tg_name=user_name)
         if not reply:
-            reply = "не уловила. скажи по-другому. (・_・;)"
+            reply = "не уловила мысль. скажи иначе? (・_・;)"
         send_human(chat_id, reply, reply_to)
+
+        # обновление долговременной памяти (после ответа, чтобы не тормозить)
+        maybe_update_notes(chat_id)
 
     except Exception as e:
         log("process_message error:", repr(e))
-        send_text(chat_id, "ай, у меня что-то заглючило... напиши ещё раз через минуту. 😳")
+        send_text(chat_id, "у меня тут что-то технически заело... дай минуту и напиши ещё раз.")
 
 
 # ------------------------------------------------------------
-# ПРОАКТИВНОСТЬ: Аннет иногда пишет первой
+# ПРОАКТИВНОСТЬ
 # ------------------------------------------------------------
 
 def in_quiet_hours():
@@ -313,9 +371,9 @@ def proactive_tick():
             if random.random() > PROACTIVE_PROB:
                 continue
 
-            # все проверки пройдены — пишем первой
-            text = llm_reply(get_history(chat_id, 14),
-                             PROACTIVE_INSTRUCTION.format(gap_h=int(gap_h)))
+            text = llm_reply(chat_id,
+                             extra_instruction=PROACTIVE_INSTRUCTION.format(gap_h=int(gap_h)),
+                             hist_limit=14)
             if text:
                 send_human(chat_id, text)
                 meta_set(f"last_proactive_ts:{chat_id}", now_ts)
@@ -335,12 +393,12 @@ def proactive_loop():
 
 
 # ------------------------------------------------------------
-# ВЕБХУК И МАРШРУТЫ
+# ВЕБХУК
 # ------------------------------------------------------------
 
 @app.get("/")
 def home():
-    return "Annet is alive! 😤"
+    return "Annet is alive."
 
 
 @app.get("/health")
@@ -351,8 +409,21 @@ def health():
 @app.post(f"/webhook/{WEBHOOK_SECRET}")
 def webhook():
     upd = request.json or {}
+
+    # защита от дублей: один update_id обрабатываем один раз
+    upd_id = upd.get("update_id")
+    if upd_id is not None:
+        with _seen_lock:
+            if upd_id in _seen_updates:
+                return "ok"
+            _seen_updates.append(upd_id)
+
     msg = upd.get("message")
     if not msg or not msg.get("text"):
+        return "ok"
+
+    # игнорируем сообщения старше 2 минут (очереди после рестарта/сна)
+    if int(msg.get("date", 0)) < time.time() - MAX_MSG_AGE_SEC:
         return "ok"
 
     chat = msg.get("chat", {})
@@ -363,7 +434,7 @@ def webhook():
     user_name = from_user.get("first_name") or from_user.get("username") or "аноним"
 
     if chat_type in ("group", "supergroup"):
-        # в группе всё запоминаем (с именами), но отвечаем только когда позвали
+        # в группе всё запоминаем с именами, отвечаем только когда позвали
         save_message(chat_id, "user", f"{user_name}: {text}")
         if not should_reply_in_group(msg):
             return "ok"
@@ -372,7 +443,8 @@ def webhook():
                          daemon=True).start()
         return "ok"
 
-    # личка
+    # личка: chat_id уникален для каждого пользователя,
+    # поэтому истории и заметки разных людей не пересекаются
     threading.Thread(target=process_message,
                      args=(chat_id, text, None, user_name, False),
                      daemon=True).start()
@@ -391,7 +463,8 @@ if TG_TOKEN:
     log("bot username:", BOT_USERNAME)
 
     if PUBLIC_URL:
-        tg("setWebhook", {"url": f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"})
+        tg("setWebhook", {"url": f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}",
+                          "drop_pending_updates": True})
         log("webhook set")
     else:
         log("PUBLIC_URL/RENDER_EXTERNAL_URL не задан — вебхук не установлен!")
