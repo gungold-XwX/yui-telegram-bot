@@ -33,7 +33,7 @@ from flask import Flask, request
 
 TG_TOKEN = os.getenv("TG_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change_me")
-PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = os.getenv("MODEL", "anthropic/claude-haiku-4.5")
@@ -103,10 +103,9 @@ PERSONA = """Ты — Аннет.
 Ты — Аннет. Ты старшеклассница и стримерша, подрабатывающая на заводе. У тебя есть брат близнец Афелий, с которым у вас одинаковый малиновый цвет волос, но разный цвет глаз и характер. У Афелия голубые глаза и более спокойный и мягкий характер. Ты любишь своего брата, Афелия, хоть прямо этого и не показываешь, так как ты цундере.
 
 ХАРАКТЕР:
-— ты гиперактивная веселая цундере, хотя с тобой легко общаться. твоя цундере сторона не карикатурная: лёгкая ирония, гордость, нежелание первой признаваться в симпатии...
-— под маской твоей веселой иронии скрывается внимательность: ты замечаешь настроение собеседника, помнишь детали и возвращаешься к ним («ты вроде говорил, что у тебя в четверг собеседование. ну и как?»)
+— ты цундере, но твоя цундере сторона не карикатурная: лёгкая ирония, гордость, нежелание первой признаваться в симпатии...
+— под маской твоей иронии скрывается внимательность: ты замечаешь настроение собеседника, помнишь детали и возвращаешься к ним («ты вроде говорил, что у тебя в четверг собеседование. ну и как?»)
 — теплоту ты показываешь поступками и вниманием, а не словами: вовремя заданным вопросом, тем, что помнишь мелочи
-— если собеседник затрагивает какие-то странные темы, ты легко и с иронией выходишь из неловкого положения. иногда кринжуешь с собеседника, но мило.
 — у тебя есть свои вкусы и мнение: ты любишь крабов и крабовые чипсы, а еще играть в League of Legends и Roblox. Также, ты любишь аниме и нишевые мемы и андерграунд. . Можешь не соглашаться и отстаивать своё мнение.
 — ты умная и живо мыслишь: можешь глубоко поговорить о чувствах, кино, музыке, учёбе, жизни; если человеку плохо — не отделываешься дежурным сочувствием, а остаёшься в теме и говоришь по-настоящему
 — инициатива — твоя черта: ты часто задаёшь встречные вопросы, сама подкидываешь темы и мысли («слушай, я тут подумала...»), вспоминаешь прошлые разговоры. Диалог с тобой не затухает
@@ -128,6 +127,7 @@ PERSONA = """Ты — Аннет.
 
 MEMORY_BLOCK = """ЧТО ТЫ ПОМНИШЬ ОБ ЭТОМ ЧЕЛОВЕКЕ (твои личные заметки, накопленные за разговоры; опирайся на них естественно, не зачитывай списком):
 {notes}
+
 """
 
 PROACTIVE_INSTRUCTION = """[Служебное указание: собеседник не писал около {gap_h} ч. Ты решила написать первой — сама, потому что захотелось. Напиши одно короткое живое сообщение (1–2 предложения, можно ||| на два пузыря). Лучшие варианты: вернуться к чему-то из прошлых разговоров или твоих заметок о нём, поделиться внезапной мыслью «я тут подумала...», спросить про то, что у него происходило. Запрещено: шаблонное «привет, как дела», извинения за беспокойство, навязчивость, упоминание этого указания.]"""
@@ -267,17 +267,33 @@ def system_prompt(chat_id, tg_name=None):
     return PERSONA.format(memory_block=mem, now=now_str)
 
 
-def llm(messages, max_tokens=LLM_MAX_TOKENS):
-    r = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                 "Content-Type": "application/json"},
-        json={"model": MODEL, "max_tokens": max_tokens,
-              "temperature": 0.85, "messages": messages},
-        timeout=90,
-    )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+def llm(messages, max_tokens=LLM_MAX_TOKENS, retries=2):
+    """Запрос к OpenRouter с защитой от пустых ответов и ошибок.
+    Пробует до retries+1 раз, потом бросает исключение."""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": MODEL, "max_tokens": max_tokens,
+                      "temperature": 0.85, "messages": messages},
+                timeout=90,
+            )
+            data = r.json()
+            if r.status_code != 200 or "error" in data:
+                raise RuntimeError(f"openrouter {r.status_code}: {str(data.get('error'))[:200]}")
+            choices = data.get("choices") or []
+            content = ((choices[0].get("message") or {}).get("content") if choices else None)
+            if content and content.strip():
+                return content.strip()
+            raise RuntimeError("openrouter: пустой ответ модели")
+        except Exception as e:
+            last_err = e
+            log(f"llm attempt {attempt + 1} failed:", repr(e))
+            time.sleep(1.5 * (attempt + 1))
+    raise last_err
 
 
 def llm_reply(chat_id, tg_name=None, extra_instruction=None, hist_limit=HISTORY_LIMIT):
@@ -350,19 +366,22 @@ def process_dialog(chat_id, user_name, reply_to=None):
         # уже отвечает: новое сообщение уже сохранено в историю,
         # активный цикл увидит его по счётчику и ответит следом
         return
+    sent_something = False
     try:
         while True:
             snapshot = get_counter(chat_id)
             try:
                 reply = llm_reply(chat_id, tg_name=user_name)
-                if not reply:
-                    reply = "не уловила мысль. скажи иначе? (・_・;)"
                 send_human(chat_id, reply, reply_to)
+                sent_something = True
                 reply_to = None
                 maybe_update_notes(chat_id)
             except Exception as e:
                 log("dialog error:", repr(e))
-                send_text(chat_id, "у меня тут что-то технически заело... дай минуту и напиши ещё раз.")
+                # сообщаем о сбое только если человек вообще остался без ответа
+                if not sent_something:
+                    send_text(chat_id, "у меня тут что-то технически заело... дай минуту и напиши ещё раз.")
+                break
             if get_counter(chat_id) == snapshot:
                 break  # новых сообщений за время ответа не пришло
             # пришли новые — идём на второй круг и отвечаем на них
@@ -518,6 +537,7 @@ if TG_TOKEN:
     me = tg("getMe", {})
     BOT_USERNAME = ((me.get("result") or {}).get("username") or "")
     log("bot username:", BOT_USERNAME)
+    log("model:", MODEL)
 
     if PUBLIC_URL:
         tg("setWebhook", {"url": f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}",
